@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вуаль · прошивка T-Deck</title>
+
+<!--
+  Заливка идёт прямо из браузера через WebSerial — это встроенная возможность Chrome,
+  позволяющая странице общаться с последовательным портом. Ничего устанавливать не нужно:
+  ни PlatformIO, ни драйверов, ни командной строки.
+
+  Работает в Chrome и Edge на компьютере. В Firefox и Safari WebSerial нет, и это не
+  ограничение страницы, а отсутствие самой возможности в браузере.
+-->
+<script type="module"
+        src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js"></script>
+
+<style>
+  :root {
+    --bg: #0B0710;
+    --surface: #16131F;
+    --surface-high: #1F1B2B;
+    --accent: #6C4BFF;
+    --accent-light: #8B7BFF;
+    --text: #FFFFFF;
+    --text-second: #9B9AA6;
+    --text-third: #57546A;
+    --warn: #E0A33E;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 20px 64px;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    justify-content: center;
+  }
+  main { width: 100%; max-width: 560px; }
+
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--text-second); margin: 0 0 28px; font-size: 15px; }
+
+  .card {
+    background: var(--surface);
+    border-radius: 14px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card h2 { font-size: 16px; margin: 0 0 10px; font-weight: 600; }
+  .card p  { margin: 0 0 10px; color: var(--text-second); font-size: 14.5px; }
+  .card p:last-child { margin-bottom: 0; }
+
+  .flash { text-align: center; padding: 28px 20px; }
+  esp-web-install-button { display: inline-block; }
+  /* Ничего НЕ прячем. Раньше здесь стояло display:none для неподдерживаемых браузеров —
+     и вместе с кнопкой исчезало объяснение, почему её нет. Человек видел пустую плашку
+     и не понимал, что делать. Пусть вместо кнопки будет внятный текст. */
+
+  button.go {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 10px;
+    padding: 14px 34px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  button.go:hover { background: var(--accent-light); }
+
+  .unsupported {
+    display: block;
+    color: var(--warn);
+    font-size: 14.5px;
+    line-height: 1.6;
+    text-align: left;
+  }
+  .unsupported strong { color: var(--warn); }
+
+  ol { margin: 0; padding-left: 22px; color: var(--text-second); font-size: 14.5px; }
+  ol li { margin-bottom: 8px; }
+  ol li:last-child { margin-bottom: 0; }
+  strong { color: var(--text); font-weight: 600; }
+
+  .danger {
+    border-left: 3px solid var(--warn);
+    padding-left: 14px;
+    margin: 0;
+  }
+  .danger strong { color: var(--warn); }
+
+  footer {
+    color: var(--text-third);
+    font-size: 13px;
+    text-align: center;
+    margin-top: 28px;
+  }
+  kbd {
+    background: var(--surface-high);
+    border-radius: 5px;
+    padding: 1px 7px;
+    font-size: 13px;
+    font-family: ui-monospace, monospace;
+    color: var(--text);
+  }
+</style>
+</head>
+
+<body>
+<main>
+  <h1>Вуаль</h1>
+  <p class="sub">Прошивка для LilyGo T-Deck · 433 МГц</p>
+
+  <div class="card danger">
+    <p><strong>Сначала подключите антенну.</strong> Передача без антенны отражает мощность
+    обратно в усилитель и выжигает его. Это единственная поломка, которая не лечится
+    перепрошивкой.</p>
+  </div>
+
+  <div class="card flash">
+    <esp-web-install-button manifest="manifest.json">
+      <button class="go" slot="activate">Прошить устройство</button>
+      <span slot="unsupported" class="unsupported">
+        <strong>Этот браузер не умеет прошивать.</strong><br>
+        Доступ к порту устройства есть только у Chrome и Edge на компьютере —
+        в Firefox и Safari такой возможности нет вовсе.<br>
+        Откройте эту страницу в Chrome, и кнопка появится.
+      </span>
+      <span slot="not-allowed" class="unsupported">
+        Страница должна открываться по https или с локального компьютера.
+      </span>
+    </esp-web-install-button>
+    <p id="fallback" class="unsupported" style="display:none">
+      <strong>Кнопка не загрузилась.</strong><br>
+      Проверьте, что страница открыта по https и не блокируется расширениями.
+      Прошивку можно скачать отдельно и залить из командной строки.
+    </p>
+  </div>
+
+  <script>
+    // Если библиотека заливки не загрузилась (нет сети, блокировщик, сбой сервера),
+    // плашка осталась бы пустой без единого слова — как и было. Показываем причину.
+    setTimeout(function () {
+      var b = document.querySelector('esp-web-install-button');
+      if (!b || !customElements.get('esp-web-install-button')) {
+        var f = document.getElementById('fallback');
+        if (f) f.style.display = 'block';
+      }
+    }, 3000);
+  </script>
+
+  <div class="card">
+    <h2>Как это делается</h2>
+    <ol>
+      <li>Подключите T-Deck кабелем USB-C. Кабель должен передавать <strong>данные</strong>,
+          а не только питание — это самая частая причина «устройство не найдено».</li>
+      <li>Включите плату выключателем сбоку.</li>
+      <li>Нажмите «Прошить устройство» и выберите порт в появившемся окне браузера.</li>
+      <li>Дождитесь конца. Плата перезапустится сама.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Если порт не появляется</h2>
+    <p>Переведите плату в режим приёма прошивки: зажмите <kbd>BOOT</kbd>, коротко нажмите
+    <kbd>RST</kbd>, отпустите <kbd>BOOT</kbd>. В этом состоянии порт появляется всегда —
+    даже если предыдущая прошивка не запускается.</p>
+    <p>На Linux может не хватать прав на порт. Разово:
+    <kbd>sudo usermod -a -G dialout $USER</kbd>, затем перезайти в систему.</p>
+  </div>
+
+  <div class="card">
+    <h2>После прошивки</h2>
+    <p>Вставьте microSD в формате FAT32 — без неё переписка не переживёт выключение.</p>
+    <p>Раскладка переключается касанием значка <strong>РУ / EN</strong> слева в строке
+    ввода. Смахивание справа налево возвращает назад, удержание на экране — рация.</p>
+  </div>
+
+  <footer>Собрано из исходников · окирпичить плату прошивкой невозможно:
+  загрузчик зашит в самом чипе</footer>
+</main>
+</body>
+</html>

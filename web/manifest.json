@@ -1,0 +1,15 @@
+{
+  "name": "Вуаль для T-Deck",
+  "version": "alpha",
+  "home_assistant_domain": "",
+  "funding_url": "",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "vual-tdeck.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
