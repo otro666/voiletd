@@ -1,0 +1,138 @@
+name: Сборка прошивки T-Deck
+
+# Собираем в облаке, потому что вручную ставить компилятор для ESP32 долго, а главное —
+# результат должен быть один и тот же у всех. На выходе готовый .bin, который заливается
+# в плату прямо из браузера, без установки чего-либо.
+on:
+  push:
+    branches: [ "**" ]
+    tags: [ "v*" ]
+  pull_request:
+  workflow_dispatch:
+
+# Вытеснение действует ТОЛЬКО на сборку: новый пуш отменяет устаревшую компиляцию,
+# это экономит минуты. Деплой в эту группу не входит — у него своя, ниже: отменённое
+# на середине развёртывание оставляет в GitHub Pages «хвост», который блокирует
+# следующие попытки ошибкой «Deployment cancelled».
+concurrency:
+  group: deck-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Кэш экономит несколько минут на каждой сборке: набор инструментов для ESP32
+      # весит сотни мегабайт и качается долго.
+      - name: Кэш PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Установить PlatformIO
+        run: |
+          pip install --upgrade platformio
+          # esptool ставим ОТДЕЛЬНО: PlatformIO держит свою копию внутри пакета платформы,
+          # и системному python она не видна. Версию закрепляем — в пятой ветке изменились
+          # имена ключей командной строки, и склейка образа перестала бы работать.
+          pip install "esptool==4.8.1"
+
+      # Тесты гоняем ДО сборки прошивки: если логика сломана, собирать нечего.
+      # Они не требуют железа и занимают секунды.
+      - name: Проверить логику
+        run: make test
+
+      - name: Собрать прошивку
+        run: |
+          # pipefail ОБЯЗАТЕЛЕН: без него код возврата берётся от tee, а не от сборки,
+          # и упавшая компиляция проходит как успешная. Ошибка всплывает позже и совсем
+          # в другом месте — «нет firmware.bin» вместо внятного сообщения компилятора.
+          set -o pipefail
+          pio run -e t-deck 2>&1 | tee build-log.txt
+
+      # Заливщик в браузере ждёт ОДИН файл, а PlatformIO выдаёт четыре: загрузчик,
+      # таблицу разделов, служебный блок и саму программу — каждый со своим адресом.
+      # Склеиваем их в единый образ, который пишется с нулевого смещения.
+      - name: Склеить единый образ
+        run: |
+          set -e
+          BUILD=.pio/build/t-deck
+          # Служебный блок boot_app0.bin ищем, а не задаём путём: он лежит внутри пакета
+          # фреймворка, и путь меняется от версии к версии.
+          BOOT_APP0=$(find "$HOME/.platformio" -name boot_app0.bin | head -1)
+          if [ -z "$BOOT_APP0" ]; then echo "boot_app0.bin не найден"; exit 1; fi
+          echo "boot_app0: $BOOT_APP0"
+
+          # Показываем, что вообще собралось: если имена не совпадут с ожидаемыми,
+          # это будет видно в логе сразу, а не через невнятную ошибку склейки.
+          ls -l "$BUILD"/*.bin || true
+          if [ ! -f "$BUILD/firmware.bin" ]; then
+            echo "── прошивка не собралась, последние строки лога ──"
+            tail -60 build-log.txt
+            exit 1
+          fi
+
+          esptool.py --chip esp32s3 merge_bin \
+            -o vual-tdeck.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x0000 "$BUILD/bootloader.bin" \
+            0x8000 "$BUILD/partitions.bin" \
+            0xe000 "$BOOT_APP0" \
+            0x10000 "$BUILD/firmware.bin"
+          ls -lh vual-tdeck.bin
+
+      - name: Собрать страницу заливки
+        run: |
+          mkdir -p site
+          cp web/index.html site/
+          cp web/manifest.json site/
+          cp vual-tdeck.bin site/
+
+      # Артефакт доступен во вкладке Actions даже при неудачной сборке — по нему видно,
+      # что именно пошло не так.
+      - name: Выложить результат
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vual-tdeck
+          path: |
+            vual-tdeck.bin
+            build-log.txt
+          retention-days: 30
+
+      # Страница заливки публикуется на GitHub Pages: открыл ссылку в Chrome, нажал
+      # «Прошить» — и всё. Ни PlatformIO, ни командной строки, ни драйверов.
+      - name: Опубликовать страницу
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Развёртывания НЕ вытесняют друг друга, а ждут очереди: у Pages одно окружение
+    # на репозиторий, и отмена на полпути ломает его для всех последующих запусков.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - id: pages
+        uses: actions/deploy-pages@v4
