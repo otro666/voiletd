@@ -440,22 +440,6 @@ constexpr int kMaxWrap     = 8;
 
 int lineH(const WLine& l) { return l.tall ? emoji::kSize + 4 : kLineText + 1; }
 
-// Голосовой пузырь: кнопка проигрывания и подпись, размер постоянный.
-constexpr int kVoiceW = 170;
-constexpr int kVoiceH = 44;
-
-/** Размер пузыря любого сообщения. Голосовое считается без раскладки текста —
- *  у него постоянная форма. Возвращает число строк текста (0 у голосового). */
-int msgExtent(const Msg& m, WLine* ls, int& w, int& h) {
-    if (m.media[0]) {
-        w = kVoiceW + (m.mine ? kTickW : 0);
-        h = kVoiceH;
-        return 0;
-    }
-    const int n = wrapText(m.text, kBubbleMaxW, ls, kMaxWrap);
-    bubbleSize(ls, n, m.mine, w, h);
-    return n;
-}
 
 /** Сообщение из одних смайликов (пробелы не в счёт). Такие рисуются БЕЗ пузыря —
  *  смайлик сам себе форма, и подложка вокруг него выглядит нашлёпкой. */
@@ -482,6 +466,23 @@ void bubbleSize(const WLine* ls, int n, bool mine, int& w, int& h) {
     w = maxW + kBubblePadX * 2 + (mine ? kTickW : 0);
     h = sumH + kBubblePadY * 2;
 }
+// Голосовой пузырь: кнопка проигрывания и подпись, размер постоянный.
+constexpr int kVoiceW = 170;
+constexpr int kVoiceH = 44;
+
+/** Размер пузыря любого сообщения. Голосовое считается без раскладки текста —
+ *  у него постоянная форма. Возвращает число строк текста (0 у голосового). */
+int msgExtent(const Msg& m, WLine* ls, int& w, int& h) {
+    if (m.media[0]) {
+        w = kVoiceW + (m.mine ? kTickW : 0);
+        h = kVoiceH;
+        return 0;
+    }
+    const int n = wrapText(m.text, kBubbleMaxW, ls, kMaxWrap);
+    bubbleSize(ls, n, m.mine, w, h);
+    return n;
+}
+
 
 /** Галочки доставки: одна — ушло, две — доставлено. Совпадает с телефоном. */
 void drawTicks(float rx, float cy, bool delivered, uint16_t bg) {
