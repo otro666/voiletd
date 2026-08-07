@@ -109,6 +109,14 @@ static bool enqueue(const uint8_t* data, size_t len, uint8_t copies) {
     return false;   // очередь полна — сообщение не принято, о чём надо сказать человеку
 }
 
+/** Сколько слотов очереди свободно. Куски файлов ограничиваются по этому числу:
+ *  займи они всё — тексты и подтверждения выбрасывались бы молча всю перекачку. */
+static size_t queueFree() {
+    size_t n = 0;
+    for (size_t i = 0; i < kQueueSize; ++i) if (!queue_[i].used) ++n;
+    return n;
+}
+
 // ── учёт эфирного времени ──────────────────────────────────────────────────────────────
 //
 // Счётчик эфирного времени оставлен только для сведения — ОГРАНИЧЕНИЯ НЕТ.
@@ -464,7 +472,11 @@ static void deliverText(contacts::Contact* c, const char* who, const char* text)
         const int idx = contactIndex(c);
         if (idx >= 0 && unread_[idx] < 255) ++unread_[idx];
     }
-    if (sdOk_) store::appendMessage(who, false, uint32_t(time(nullptr)), text);
+    // Пишем ВСЕГДА и с маячком в порт: спор «сохраняется или нет» решают факты из
+    // лога, а не воспоминания — и мои, и чьи угодно.
+    const bool saved = sdOk_ && store::appendMessage(who, false, uint32_t(time(nullptr)), text);
+    ets_printf("[vual] входящее от «%s»: %s\n", who,
+               saved ? "записано в историю" : "НЕ записано (карта?)");
     audio::device::chime();
 }
 
@@ -529,7 +541,13 @@ static void sendDraft() {
 
     // Копии с разнесением во времени и по частоте — главное средство против городских
     // переотражений: три копии дают эффект прибавки 14 дБ мощности.
-    enqueue(pkt, hl + n, voile::kDefaultCopies);
+    //
+    // Отказ очереди — не молчание: черновик остаётся на месте, а строка ввода говорит,
+    // что эфир занят. Раньше отказ глотался, и сообщение просто исчезало.
+    if (!enqueue(pkt, hl + n, voile::kDefaultCopies)) {
+        ui::setInput("Эфир занят — попробуйте через секунду", 0, false);
+        return;
+    }
 
     // И в сеть тоже: собеседник на Wi-Fi (телефон в той же сети) иначе не получает
     // НИЧЕГО — отправка была радио-только, хотя приём из сети работал. Дубль не
@@ -562,6 +580,10 @@ static void sendDraft() {
  */
 static bool radioSendChunk(const char* peer, const uint8_t* data, size_t len) {
     if (!radioReady) return false;
+    // Последние ТРИ слота очереди куску не отдаются — они за текстами, подтверждениями
+    // и объявлениями. Иначе многоминутная перекачка голосового съедала очередь целиком,
+    // и всё остальное «не доходило в принципе»: enqueue отвечал отказом, а отказ глотался.
+    if (queueFree() <= 3) return false;
     contacts::Contact* c = nullptr;
     for (size_t i = 0; i < contacts::count(); ++i) {
         contacts::Contact* k = contacts::at(i);
@@ -575,11 +597,14 @@ static bool radioSendChunk(const char* peer, const uint8_t* data, size_t len) {
     memcpy(h.dst, c->addr, 4);
     h.seq = nextSeq();
     h.part = voile::packPart(0, 1);
-    h.copy = voile::packPart(0, voile::kDefaultCopies);
+    // Кускам — ДВЕ копии вместо трёх. Потеря куска и так редка при разнесении, а третья
+    // копия удлиняла бы каждую перекачку в полтора раза. Тексты остаются при трёх:
+    // они короткие, и там копии почти ничего не стоят.
+    h.copy = voile::packPart(0, 2);
     const size_t hl = voile::writeHeader(pkt, h);
     if (hl + len > sizeof(pkt)) return false;
     memcpy(pkt + hl, data, len);
-    return enqueue(pkt, hl + len, voile::kDefaultCopies);
+    return enqueue(pkt, hl + len, 2);
 }
 
 /** Собрать состояние устройства для экрана «Состояние». */
@@ -992,7 +1017,9 @@ static void openChat(size_t idx) {
     // сообщения предыдущего — лента общая, а переписки разные.
     ui::clearMessages();
     contacts::Contact* c = contacts::at(idx);
-    if (c && sdOk_) store::loadMessages(c->name, 20, onHistoryLine);
+    // Подгружаем столько, сколько лента вообще держит: раньше при пределе ленты в 30
+    // подтягивалось лишь 20, и хвост истории терялся без причины.
+    if (c && sdOk_) store::loadMessages(c->name, 28, onHistoryLine);
     ui::draw(screen_);
 }
 
@@ -1573,19 +1600,23 @@ static void handleEvent(const input::Event& e) {
         }
         case ui::HIT_ROW:
             switch (screen_) {
-            case ui::SCR_CHAT:
-                // Нажатие на ленту проигрывает последнее принятое голосовое или
-                // останавливает проигрывание. Принять голосовое и не иметь возможности
-                // его послушать — половина дела.
-                if (lastVoice_[0]) {
+            case ui::SCR_CHAT: {
+                // Касание голосового пузыря проигрывает ИМЕННО его — и своё, и принятое.
+                // Повторное касание останавливает. «Последнее принятое» больше не при
+                // делах: у отправителя его не было вовсе, и свои голосовые не игрались.
+                const char* v = ui::voiceAt(h.rowIndex);
+                if (v && *v) {
                     if (audio::device::isPlaying()) {
                         audio::device::stopPlayback();
                         store::log("voice", "проигрывание остановлено");
-                    } else if (audio::device::play(lastVoice_)) {
-                        store::log("voice", "проигрываю принятое");
+                    } else if (audio::device::play(v)) {
+                        store::log("voice", "проигрываю голосовое");
+                    } else {
+                        store::log("voice", "не удалось открыть файл голосового");
                     }
                 }
                 break;
+            }
             case ui::SCR_CHATS:
                 if (size_t(h.rowIndex) < contacts::count()) openChat(size_t(h.rowIndex));
                 break;
