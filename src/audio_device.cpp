@@ -194,6 +194,38 @@ void stopPlayback() {
 
 bool isPlaying() { return g_play; }
 
+void bootMelody() {
+    // Проверка динамика на слух при каждом запуске: если мелодии нет — путь звука
+    // мёртв на уровне железа, и искать причину тишины в проигрывании голосовых
+    // бессмысленно. Двухголосие: нота и терция над ней, три ступени вверх.
+    if (!g_ready) return;
+    i2s_start(kPort);
+    const struct { float a, b; int ms; } notes[3] = {
+        {523.25f, 659.25f, 140},   // до-ми
+        {659.25f, 783.99f, 140},   // ми-соль
+        {783.99f, 987.77f, 220},   // соль-си
+    };
+    for (const auto& nt : notes) {
+        const int total = kSampleRate * nt.ms / 1000;
+        int made = 0;
+        while (made < total) {
+            const int n = (total - made) < int(kChunk) ? (total - made) : int(kChunk);
+            for (int i = 0; i < n; ++i) {
+                const float t = float(made + i);
+                const float env = 1.0f - t / float(total);
+                const float v = sinf(6.2831853f * nt.a * t / kSampleRate) +
+                                0.6f * sinf(6.2831853f * nt.b * t / kSampleRate);
+                g_pcm[i] = int16_t(6500.0f * env * v);
+            }
+            size_t written = 0;
+            i2s_write(kPort, g_pcm, size_t(n) * sizeof(int16_t), &written, portMAX_DELAY);
+            made += n;
+        }
+    }
+    i2s_zero_dma_buffer(kPort);
+    i2s_stop(kPort);
+}
+
 void chime() {
     // Сигнал входящего: два коротких восходящих тона, как принято у мессенджеров.
     // Поверх записи или проигрывания не лезем — там шина занята делом.

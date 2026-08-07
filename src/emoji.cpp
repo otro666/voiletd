@@ -249,6 +249,27 @@ void draw(size_t index, int x, int y, uint16_t bg) {
     if (fast) cb->pushSprite(x, y);
 }
 
+void drawScaled(size_t index, int x, int y, int size, uint16_t bg) {
+    if (index >= kCount || size <= 0 || size > kSize) return;
+    auto& tft = vualScreen();
+    // Ближайшая точка: для значка в полтора-два раза меньше оригинала этого достаточно,
+    // а буфер и спрайт не нужны вовсе — точек мало.
+    for (int oy = 0; oy < size; ++oy)
+        for (int ox = 0; ox < size; ++ox) {
+            const int sx = ox * kSize / size, sy = oy * kSize / size;
+            const int i = sy * kSize + sx;
+            uint16_t col = bg;
+            if (index < 64 && g_baked[index]) {
+                const Baked* b = g_baked[index];
+                if (b->alpha[i]) col = overBg(b->onBlack[i], bg, b->alpha[i]);
+            } else {
+                const RomEmoji& rom = kRom[index];
+                if (rom.alpha[i]) col = overBg(rom.premul[i], bg, rom.alpha[i]);
+            }
+            tft.drawPixel(x + ox, y + oy, col);
+        }
+}
+
 size_t match(const char* text, size_t& indexOut) {
     if (!text || !*text) return 0;
     for (size_t i = 0; i < kCount; ++i) {

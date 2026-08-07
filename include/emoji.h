@@ -42,6 +42,11 @@ extern const size_t kCount;
  */
 void draw(size_t index, int x, int y, uint16_t bg);
 
+/** То же, но в уменьшенном размере (для строки ввода): картинка прореживается до
+ *  size×size точек. Без этого эмодзи в поле рисовался шрифтом — а в шрифте его нет,
+ *  и вместо смайлика вставал квадрат-заглушка. */
+void drawScaled(size_t index, int x, int y, int size, uint16_t bg);
+
 /** Проверить, есть ли на карте набор картинок. Вызывается при запуске. */
 void scanCard();
 

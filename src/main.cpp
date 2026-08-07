@@ -50,7 +50,6 @@ static volatile bool packetReady = false;
 static bool radioReady = false;
 /** Отсев повторов: каждый кадр идёт тремя копиями, и без этого одно сообщение
  *  показывалось бы трижды. */
-static voile::SeenCache dedup;
 
 /**
  * ОДИН номер кадра на всё устройство.
@@ -157,6 +156,9 @@ static constexpr uint32_t kWaitTxEnd = 0xFFFFFFFFu;
 /** Начать передачу копии. Возвращает false, если радио занято. */
 static bool sendCopy(Pending& p) {
     if (!radioReady || txBusy) return false;
+    // Принятый, но ещё не разобранный кадр важнее нашей передачи: старт передачи
+    // затирает приёмный буфер модуля, и кадр пропадает молча. Отдаём круг приёму.
+    if (packetReady) return false;
 
     // Все копии идут на ОДНОЙ частоте. Раньше копии смещались на ±250 кГц, но приёмник
     // всегда слушает только основную частоту — смещённые копии физически некому было
@@ -165,10 +167,15 @@ static bool sendCopy(Pending& p) {
 
     const int st = radio.startTransmit(p.data, p.len);
     if (st != RADIOLIB_ERR_NONE) {
-        Serial.printf("передача не началась: %d\n", st);
+        ets_printf("[vual] передача не началась: %d\n", st);
         radio.startReceive();
         return false;
     }
+    // Маячок каждого ухода в эфир: по парным логам двух плат видно, вышел ли кадр
+    // и услышан ли — спор «уходят непонятно куда» решается строками, а не верой.
+    ets_printf("[vual] -> эфир: тип %u, номер %u, копия %u, %u байт\n",
+               unsigned(p.data[0]), unsigned(p.data[5] | (p.data[6] << 8)),
+               unsigned(p.copyIndex), unsigned(p.len));
     txBusy = true;
     txStarted = millis();
     return true;
@@ -191,7 +198,9 @@ static void checkTxDone() {
         packetReady = false;
         txBusy = false;
         airtimeUsedMs += millis() - txStarted;
-        if (timeout) Serial.println("передача не завершилась вовремя — сбрасываю");
+        if (timeout) ets_printf("[vual] передача не завершилась вовремя — сброс\n");
+        else ets_printf("[vual] передано за %lu мс\n",
+                        (unsigned long)(millis() - txStarted));
         radio.finishTransmit();
         // Вернуться в приём обязательно: без этого следующий пакет будет потерян.
         radio.startReceive();
@@ -276,7 +285,21 @@ static int  contactIndex(contacts::Contact* c);
 static void deliverText(contacts::Contact* c, const char* who, const char* text);
 static void bridgeRadioToNet(const uint8_t meetAddr[4], const uint8_t* payload, size_t len);
 
-static void handlePacket() {
+/**
+ * Разбор принятого кадра. ВОЗВРАТ В ПРИЁМ ГАРАНТИРУЕТ ОБЁРТКА НИЖЕ — здесь о нём
+ * думать не нужно, и ни одна ветка больше не обязана помнить про startReceive.
+ *
+ * История ошибки, ради которой это переделано. Радио полудуплексное: после чтения
+ * кадра его надо явно вернуть в приём. Раньше это происходило «само» — плата отвечала
+ * объявлением на КАЖДОЕ услышанное объявление, и конец ответной передачи возвращал
+ * приём. Когда ответ остался только для НОВЫХ собеседников, ветка объявления от
+ * знакомого стала завершаться голым return — и плата ГЛОХЛА до своего следующего
+ * объявления, до двух минут. Доставка превратилась в лотерею окон глухоты, а заплатки
+ * в отдельных ветках (подтверждения, куски файлов) были войной с симптомами.
+ * Правило одно: обещание уровня «мы всегда слушаем» держит ОДНО место, а не дисциплина
+ * каждой ветки.
+ */
+static void handlePacketInner() {
     uint8_t buf[voile::kMaxPacket];
     const int len = radio.getPacketLength();
     if (len <= 0 || size_t(len) > sizeof(buf)) { radio.startReceive(); return; }
@@ -285,21 +308,21 @@ static void handlePacket() {
     voile::Header h;
     if (!voile::readHeader(buf, size_t(len), h)) { radio.startReceive(); return; }
 
+    ets_printf("[vual] <- эфир: тип %u, номер %u, %d дБм\n",
+               unsigned(h.type), unsigned(h.seq), int(radio.getRSSI()));
+
     // Копии одного сообщения приходят несколько раз — принять надо ровно один.
-    if (seen_.seen(h.src, h.seq)) { radio.startReceive(); return; }
+    if (seen_.seen(h.src, h.seq)) {
+        ets_printf("[vual]    повтор — отсеян\n");
+        radio.startReceive();
+        return;
+    }
 
     ui::Status st{};
     st.rssi = int(radio.getRSSI());
     st.snr  = radio.getSNR();
     st.linkUp = true;
     ui::drawStatus(st);
-
-    // ── отсев повторов ────────────────────────────────────────────────────────────────
-    //
-    // Каждый кадр уходит ТРЕМЯ копиями — это и есть разнесение, ради него всё и затевалось.
-    // Но без отсева получатель показывал бы одно сообщение трижды. Проверка по номеру и
-    // отправителю: копии одинаковы во всём, кроме номера копии.
-    if (dedup.seen(h.src, h.seq)) return;
 
     // ── объявление из эфира ───────────────────────────────────────────────────────────
     if (h.type == voile::FT_HELLO) {
@@ -461,16 +484,15 @@ static int contactIndex(contacts::Contact* c) {
 /**
  * Единый путь входящего текста: с радио и из сети сообщение проходит одинаково.
  *
- * В ленту оно попадает ТОЛЬКО если открыта переписка именно с отправителем — раньше
- * входящее вливалось в любой открытый чат и путало переписки. Иначе — счётчик
- * непрочитанного у строки собеседника. На карту пишется всегда: история не зависит от
- * того, куда смотрел человек. И звук — как в телефоне.
+ * Показ в ленту — БЕЗУСЛОВНЫЙ, ровно как в доказанно рабочей версии: лента чистится
+ * при каждом входе в переписку и перечитывается с карты, поэтому запись в невидимый
+ * буфер безвредна. Моя «умная» проверка открытого чата отсюда убрана: любое условие в
+ * критическом пути — это способ потерять сообщение, и терять его из-за красоты нельзя.
+ * Счётчик непрочитанного и звук — ВДОБАВОК, а не вместо.
  */
 static void deliverText(contacts::Contact* c, const char* who, const char* text) {
-    const bool inThisChat = screen_ == ui::SCR_CHAT && c && contacts::at(selected_) == c;
-    if (inThisChat) {
-        ui::addMessage(text, false, uint32_t(millis() / 1000), true);
-    } else if (c) {
+    ui::addMessage(text, false, uint32_t(millis() / 1000), true);
+    if (c && !(screen_ == ui::SCR_CHAT && contacts::at(selected_) == c)) {
         const int idx = contactIndex(c);
         if (idx >= 0 && unread_[idx] < 255) ++unread_[idx];
     }
@@ -883,20 +905,25 @@ static void onFileReady(const char* peer, const char* path, xfer::Kind kind, boo
                 contacts::Contact* k = contacts::at(i);
                 if (k && strcmp(k->name, peer) == 0) { c = k; break; }
             }
-            const bool inThisChat = screen_ == ui::SCR_CHAT && c &&
-                                    contacts::at(selected_) == c;
-            if (inThisChat) ui::addVoiceMessage(path, secs, false, true);
-            else if (c) {
+            // Показ безусловный — тем же правилом, что у текста: условие в пути
+            // доставки — способ потерять сообщение. Непрочитанное — вдобавок.
+            ui::addVoiceMessage(path, secs, false, true);
+            if (c && !(screen_ == ui::SCR_CHAT && contacts::at(selected_) == c)) {
                 const int idx = contactIndex(c);
                 if (idx >= 0 && unread_[idx] < 255) ++unread_[idx];
                 refreshPeers();
             }
-            audio::device::chime();
+            chimePending_ = true;
         } else {
             ui::addMessage(what, false, uint32_t(millis() / 1000), true);
         }
-        store::appendMessage(peer, false, uint32_t(time(nullptr)),
-                             kind == xfer::K_VOICE ? "🎤 голосовое" : what);
+        if (kind == xfer::K_VOICE) {
+            char rec[96];
+            snprintf(rec, sizeof(rec), "voice:%s", path);
+            store::appendMessage(peer, false, uint32_t(time(nullptr)), rec);
+        } else {
+            store::appendMessage(peer, false, uint32_t(time(nullptr)), what);
+        }
     } else {
         // Своё сообщение «голосовое» уже стоит в ленте с момента записи — добавлять
         // второе нельзя, их и так путали. Завершение передачи даёт ему вторую галочку.
@@ -1002,6 +1029,17 @@ static void openMenuItem() {
 
 /** Приёмник строк истории: интерфейс складывает их в ленту. */
 static void onHistoryLine(bool mine, uint32_t ts, const char* text) {
+    // Голосовые в истории хранятся маркером с путём: после перезахода они остаются
+    // ПРОИГРЫВАЕМЫМИ пузырями. Раньше писался текст со значком, которого нет в шрифте, —
+    // и вместо иконки вставал квадрат-заглушка.
+    if (strncmp(text, "voice:", 6) == 0) {
+        const char* path = text + 6;
+        int secs = 0;
+        File f = SD.open(path, FILE_READ);
+        if (f) { secs = int((f.size() > 12 ? f.size() - 12 : 0) * 2 / 8000); f.close(); }
+        ui::addVoiceMessage(path, secs, mine, true);
+        return;
+    }
     ui::addMessage(text, mine, ts, true);
 }
 
@@ -1122,8 +1160,11 @@ static void stopVoice() {
                  (unsigned long)ms, viaNet ? "сети" : "радио");
         store::log("voice", msg);
         ui::addVoiceMessage(voicePath_, int(ms / 1000), true, false);
-        if (sdOk_) store::appendMessage(c->name, true, uint32_t(time(nullptr)),
-                                        "🎤 голосовое");
+        if (sdOk_) {
+            char rec[96];
+            snprintf(rec, sizeof(rec), "voice:%s", voicePath_);
+            store::appendMessage(c->name, true, uint32_t(time(nullptr)), rec);
+        }
     }
 }
 
@@ -1793,6 +1834,7 @@ void setup() {
     // Без микрофона голосовые не запишутся, но всё остальное работает — не останавливаемся.
     const bool audioOk = audio::device::begin();
     boot::done(audioOk ? boot::OK : boot::WARN, audioOk ? nullptr : "нет");
+    if (audioOk) audio::device::bootMelody();   // проверка динамика на слух
 
     // ── 7. Контакты ──────────────────────────────────────────────────────────────────
     boot::step("contacts");
@@ -1886,7 +1928,10 @@ void loop() {
 
     if (packetReady && !txBusy) {
         packetReady = false;
-        handlePacket();
+        handlePacketInner();
+        // Возврат в приём — безусловный и единственный. Лишний вызов безвреден,
+        // пропущенный — глухота до следующей своей передачи.
+        radio.startReceive();
     }
     pumpQueue();
 

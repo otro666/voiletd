@@ -869,15 +869,46 @@ void setInput(const char* text, size_t, bool cyrillic) {
     // что набираешь сейчас.
     aaRoundRect(kFieldX, y + 5, kFieldW, kInputH - 10, 12.0f, kBg, kSurface);
     setF(F_TEXT);
-    const int tw = input_[0] ? tft.textWidth(input_) : 0;
+    // Ширина черновика считается поэлементно: буквы шрифтом, эмодзи — своей шириной.
+    // Шрифтом эмодзи мерить нельзя: его там нет, и ширина выходила нулевой.
+    constexpr int kMiniEmoji = 20;
+    int tw = 0;
+    for (const char* p = input_; *p; ) {
+        size_t idx;
+        const size_t em = emoji::match(p, idx);
+        if (em) { tw += kMiniEmoji + 2; p += em; continue; }
+        const int len = utf8Len(p);
+        char b[5] = {}; memcpy(b, p, size_t(len));
+        tw += tft.textWidth(b);
+        p += len;
+    }
+
     tft.setClipRect(kFieldX + 8, y, kFieldW - 16, kInputH);
-    tft.setTextColor(input_[0] ? kTextPrimary : kTextTertiary, kBg);
-    if (tw > kFieldW - 16) {
-        tft.setTextDatum(textdatum_t::middle_right);
-        tft.drawString(input_, kFieldX + kFieldW - 8, y + kInputH / 2);
-    } else {
+    if (!input_[0]) {
         tft.setTextDatum(textdatum_t::middle_left);
-        tft.drawString(input_[0] ? input_ : "Сообщение", kFieldX + 8, y + kInputH / 2);
+        tft.setTextColor(kTextTertiary, kBg);
+        tft.drawString("Сообщение", kFieldX + 8, y + kInputH / 2);
+    } else {
+        // Хвост длинного черновика прижат вправо: видно то, что набираешь сейчас.
+        int cx = tw > kFieldW - 16 ? kFieldX + kFieldW - 8 - tw : kFieldX + 8;
+        const int cy = y + kInputH / 2;
+        tft.setTextDatum(textdatum_t::middle_left);
+        tft.setTextColor(kTextPrimary, kBg);
+        for (const char* p = input_; *p; ) {
+            size_t idx;
+            const size_t em = emoji::match(p, idx);
+            if (em) {
+                emoji::drawScaled(idx, cx, cy - kMiniEmoji / 2, kMiniEmoji, kBg);
+                cx += kMiniEmoji + 2;
+                p += em;
+                continue;
+            }
+            const int len = utf8Len(p);
+            char b[5] = {}; memcpy(b, p, size_t(len));
+            tft.drawString(b, cx, cy);
+            cx += tft.textWidth(b);
+            p += len;
+        }
     }
     tft.clearClipRect();
 
