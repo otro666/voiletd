@@ -10,6 +10,7 @@
 #include <string.h>
 #include <SD.h>
 #include <driver/i2s.h>
+#include <math.h>
 
 #include "board.h"
 
@@ -20,6 +21,22 @@ namespace {
 
 constexpr i2s_port_t kPort = I2S_NUM_0;
 constexpr size_t kChunk = kFrameSamples * 4;   // отсчётов за один заход
+
+/** Частота голосовых СООБЩЕНИЙ — вдвое ниже частоты шины. Для радио каждый байт на
+ *  счету: 8 кГц режет поток пополам, а разборчивость речи почти не страдает — телефонные
+ *  линии десятилетиями жили на этой частоте. Шина остаётся на 16 кГц ради рации,
+ *  совместимой с телефоном: сообщения прореживаются при записи и раздваиваются при
+ *  проигрывании. */
+constexpr int kVoiceRate = 8000;
+
+/** Усиление на проигрывании. Динамик платы тихий, а записи с микрофона ещё и негромкие;
+ *  умножение с насыщением — самый дешёвый способ сделать речь слышимой. */
+inline int16_t amplify(int32_t v) {
+    v *= 3;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    return int16_t(v);
+}
 
 bool      g_ready = false;
 bool      g_rec = false;
@@ -77,7 +94,7 @@ bool startRecording(const char* path) {
     VoiceHeader h{};
     memcpy(h.magic, "VUAV", 4);
     h.codec = 1;                       // сжатый
-    h.sampleRate = uint16_t(kSampleRate);
+    h.sampleRate = uint16_t(kVoiceRate);
     h.samples = 0;
     g_file.write(reinterpret_cast<uint8_t*>(&h), sizeof(h));
 
@@ -95,10 +112,16 @@ void pumpRecording() {
     // остановило бы весь интерфейс — а он должен рисовать полоску записи.
     if (i2s_read(kPort, g_pcm, sizeof(g_pcm), &got, 0) != ESP_OK || got == 0) return;
 
+    // Прореживание вдвое усреднением пар: шина даёт 16 кГц, в файл идёт 8. Усреднение,
+    // а не выбрасывание каждого второго: выброшенные отсчёты возвращаются свистом на
+    // высоких — это зовётся наложением, и лечится оно именно усреднением.
     const size_t n = got / sizeof(int16_t);
-    const size_t bytes = adpcmEncode(g_encState, g_pcm, n, g_packed);
+    const size_t half = n / 2;
+    for (size_t i = 0; i < half; ++i)
+        g_pcm[i] = int16_t((int32_t(g_pcm[i * 2]) + g_pcm[i * 2 + 1]) / 2);
+    const size_t bytes = adpcmEncode(g_encState, g_pcm, half, g_packed);
     g_file.write(g_packed, bytes);
-    g_samples += n;
+    g_samples += half;
 }
 
 uint32_t stopRecording() {
@@ -109,7 +132,7 @@ uint32_t stopRecording() {
     i2s_zero_dma_buffer(kPort);
     i2s_stop(kPort);               // запись кончилась — шину гасим
 
-    const uint32_t ms = uint32_t(uint64_t(g_samples) * 1000 / kSampleRate);
+    const uint32_t ms = uint32_t(uint64_t(g_samples) * 1000 / kVoiceRate);
     g_file.seek(offsetof(VoiceHeader, samples));
     g_file.write(reinterpret_cast<const uint8_t*>(&g_samples), sizeof(g_samples));
     g_file.close();
@@ -118,11 +141,22 @@ uint32_t stopRecording() {
 
 bool isRecording() { return g_rec; }
 
+uint16_t g_playRate = kVoiceRate;
+
 bool play(const char* path) {
     if (!g_ready || g_play) return false;
     g_file = SD.open(path, FILE_READ);
     if (!g_file) return false;
-    g_file.seek(sizeof(VoiceHeader));
+    // Частоту берём из заголовка: старые записи сделаны на 16 кГц, новые — на 8, и обе
+    // должны звучать правильно, а не вдвое быстрее или медленнее.
+    VoiceHeader h{};
+    if (g_file.read(reinterpret_cast<uint8_t*>(&h), sizeof(h)) == sizeof(h) &&
+        memcmp(h.magic, "VUAV", 4) == 0 && h.sampleRate > 0) {
+        g_playRate = h.sampleRate;
+    } else {
+        g_playRate = kVoiceRate;
+        g_file.seek(sizeof(VoiceHeader));
+    }
     g_decState = AdpcmState{};
     i2s_start(kPort);
     g_play = true;
@@ -131,12 +165,24 @@ bool play(const char* path) {
 
 void pumpPlayback() {
     if (!g_play) return;
-    const int read = g_file.read(g_packed, sizeof(g_packed));
+    // Половина буфера: развёрнутый и раздвоенный звук должен помещаться в тот же g_pcm.
+    const int read = g_file.read(g_packed, sizeof(g_packed) / 2);
     if (read <= 0) { stopPlayback(); return; }
 
     const size_t n = adpcmDecode(g_decState, g_packed, size_t(read), g_pcm);
     size_t written = 0;
-    i2s_write(kPort, g_pcm, n * sizeof(int16_t), &written, portMAX_DELAY);
+    if (g_playRate <= kVoiceRate) {
+        // Файл на 8 кГц, шина на 16: каждый отсчёт дважды, с усилением.
+        for (size_t i = n; i-- > 0; ) {
+            const int16_t v = amplify(g_pcm[i]);
+            g_pcm[i * 2] = v;
+            g_pcm[i * 2 + 1] = v;
+        }
+        i2s_write(kPort, g_pcm, n * 2 * sizeof(int16_t), &written, portMAX_DELAY);
+    } else {
+        for (size_t i = 0; i < n; ++i) g_pcm[i] = amplify(g_pcm[i]);
+        i2s_write(kPort, g_pcm, n * sizeof(int16_t), &written, portMAX_DELAY);
+    }
 }
 
 void stopPlayback() {
@@ -147,6 +193,33 @@ void stopPlayback() {
 }
 
 bool isPlaying() { return g_play; }
+
+void chime() {
+    // Сигнал входящего: два коротких восходящих тона, как принято у мессенджеров.
+    // Поверх записи или проигрывания не лезем — там шина занята делом.
+    if (!g_ready || g_rec || g_play) return;
+    i2s_start(kPort);
+    const struct { float hz; int ms; } notes[2] = {{880.0f, 90}, {1174.7f, 130}};
+    for (const auto& nt : notes) {
+        const int total = kSampleRate * nt.ms / 1000;
+        int made = 0;
+        while (made < total) {
+            const int n = (total - made) < int(kChunk) ? (total - made) : int(kChunk);
+            for (int i = 0; i < n; ++i) {
+                const float t = float(made + i);
+                // Плавный спад к концу ноты, чтобы не щёлкало на границе.
+                const float env = 1.0f - t / float(total);
+                g_pcm[i] = int16_t(9000.0f * env *
+                                   sinf(6.2831853f * nt.hz * t / kSampleRate));
+            }
+            size_t written = 0;
+            i2s_write(kPort, g_pcm, size_t(n) * sizeof(int16_t), &written, portMAX_DELAY);
+            made += n;
+        }
+    }
+    i2s_zero_dma_buffer(kPort);
+    i2s_stop(kPort);
+}
 
 }  // namespace device
 }  // namespace audio

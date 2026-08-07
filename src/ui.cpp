@@ -202,7 +202,13 @@ constexpr int kFieldW  = (kMicCX - 16) - kFieldX;
 // сколько вмещает черновик: раньше буфер строки был 64 байта и длинные сообщения
 // обрезались уже на экране.
 constexpr size_t kMaxMsgs = 30;
-struct Msg { char text[160]; bool mine; bool delivered; uint32_t ts; };
+struct Msg {
+    char text[160];
+    bool mine;
+    bool delivered;
+    uint32_t ts;
+    char media[64];    // путь к голосовому; пусто — обычный текст
+};
 Msg msgs_[kMaxMsgs];
 size_t msgCount_ = 0;
 
@@ -215,6 +221,7 @@ Screen current_ = SCR_CHATS;
 constexpr size_t kMaxPeers = 16;
 const char* peerNames_[kMaxPeers] = {};
 bool        peerOnline_[kMaxPeers] = {};
+uint8_t     peerUnread_[kMaxPeers] = {};
 size_t      peerCount_ = 0;
 size_t      peerSel_ = 0;
 /** Первая видимая строка списка: строки стали крупными, и все собеседники разом на экран
@@ -433,6 +440,23 @@ constexpr int kMaxWrap     = 8;
 
 int lineH(const WLine& l) { return l.tall ? emoji::kSize + 4 : kLineText + 1; }
 
+// Голосовой пузырь: кнопка проигрывания и подпись, размер постоянный.
+constexpr int kVoiceW = 170;
+constexpr int kVoiceH = 44;
+
+/** Размер пузыря любого сообщения. Голосовое считается без раскладки текста —
+ *  у него постоянная форма. Возвращает число строк текста (0 у голосового). */
+int msgExtent(const Msg& m, WLine* ls, int& w, int& h) {
+    if (m.media[0]) {
+        w = kVoiceW + (m.mine ? kTickW : 0);
+        h = kVoiceH;
+        return 0;
+    }
+    const int n = wrapText(m.text, kBubbleMaxW, ls, kMaxWrap);
+    bubbleSize(ls, n, m.mine, w, h);
+    return n;
+}
+
 /** Сообщение из одних смайликов (пробелы не в счёт). Такие рисуются БЕЗ пузыря —
  *  смайлик сам себе форма, и подложка вокруг него выглядит нашлёпкой. */
 bool emojiOnly(const char* text) {
@@ -478,11 +502,27 @@ void drawBubble(const Msg& m, const WLine* ls, int n, int yTop, int w, int h, bo
     const uint16_t fill = bare ? kBg : (m.mine ? kAccent : kSurfaceHigh);
     if (!bare) aaRoundRect(x, yTop, w, h, 9.0f, fill, kBg);
 
-    int cy = yTop + kBubblePadY;
-    for (int i = 0; i < n; ++i) {
-        const int lh = lineH(ls[i]);
-        drawWrapped(ls[i], x + kBubblePadX, cy + lh / 2, kTextPrimary, fill);
-        cy += lh;
+    if (m.media[0]) {
+        // Кнопка проигрывания и подпись — как в телефоне: видно, что это звук, и
+        // понятно, куда нажимать.
+        const float pcx = x + 22, pcy = yTop + h / 2.0f;
+        const uint16_t knob = m.mine ? kTextPrimary : kAccent;
+        const uint16_t tri  = m.mine ? kAccent : kTextPrimary;
+        aaCircle(pcx, pcy, 13.0f, knob, fill);
+        aaLine(pcx - 3, pcy - 6, pcx + 6, pcy, 2.2f, tri, knob);
+        aaLine(pcx - 3, pcy + 6, pcx + 6, pcy, 2.2f, tri, knob);
+        aaLine(pcx - 3, pcy - 6, pcx - 3, pcy + 6, 2.0f, tri, knob);
+        setF(F_TEXT);
+        tft.setTextDatum(textdatum_t::middle_left);
+        tft.setTextColor(kTextPrimary, fill);
+        tft.drawString(m.text, x + 42, int(pcy) - 1);
+    } else {
+        int cy = yTop + kBubblePadY;
+        for (int i = 0; i < n; ++i) {
+            const int lh = lineH(ls[i]);
+            drawWrapped(ls[i], x + kBubblePadX, cy + lh / 2, kTextPrimary, fill);
+            cy += lh;
+        }
     }
     if (m.mine) drawTicks(x + w - 9, yTop + h - 11, m.delivered, fill);
 }
@@ -495,8 +535,8 @@ int chatTotalHeight() {
     int total = 0;
     WLine ls[kMaxWrap];
     for (size_t i = 0; i < msgCount_; ++i) {
-        const int n = wrapText(msgs_[i].text, kBubbleMaxW, ls, kMaxWrap);
-        int w, h; bubbleSize(ls, n, msgs_[i].mine, w, h);
+        int w, h;
+        msgExtent(msgs_[i], ls, w, h);
         total += h + kBubbleGap;
     }
     return total;
@@ -529,12 +569,12 @@ void drawChatArea() {
     WLine ls[kMaxWrap];
     for (size_t k = msgCount_; k-- > 0; ) {
         const Msg& m = msgs_[k];
-        const int n = wrapText(m.text, kBubbleMaxW, ls, kMaxWrap);
-        int w, h; bubbleSize(ls, n, m.mine, w, h);
+        int w, h;
+        const int n = msgExtent(m, ls, w, h);
         const int yTop = yBottom - h;
         if (yTop > bottom) { yBottom = yTop - kBubbleGap; continue; }  // ниже окна
         if (yBottom < top) break;                                      // выше окна — всё
-        drawBubble(m, ls, n, yTop, w, h, emojiOnly(m.text));
+        drawBubble(m, ls, n, yTop, w, h, !m.media[0] && emojiOnly(m.text));
         yBottom = yTop - kBubbleGap;
     }
     tft.clearClipRect();
@@ -585,6 +625,19 @@ void drawPeerRow(size_t i, int y) {
     tft.setTextColor(arm ? kDanger : (peerOnline_[i] ? kOnline : kTextTertiary), rowBg);
     tft.drawString(arm ? "нажмите ещё раз — удалить"
                        : (peerOnline_[i] ? "в сети" : "не в сети"), 48, y + 29);
+
+    // Непрочитанные: акцентный кружок с числом, левее крестика. Ровно та мелочь,
+    // по которой глаз находит, куда заходить.
+    if (peerUnread_[i] && !arm) {
+        const float ucx = 320 - 56, ucy = acy;
+        aaCircle(ucx, ucy, 10.0f, kAccent, rowBg);
+        char n[6];
+        snprintf(n, sizeof(n), "%u", unsigned(peerUnread_[i] > 99 ? 99 : peerUnread_[i]));
+        setF(F_SMALL);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextColor(kTextPrimary, kAccent);
+        tft.drawString(n, int(ucx), int(ucy));
+    }
 
     // Крестик удаления справа. Взведённый — белый крест на красном круге.
     const float dcx = 320 - 22, dcy = acy;
@@ -705,9 +758,49 @@ void addMessage(const char* text, bool mine, uint32_t ts, bool delivered) {
     m.mine = mine;
     m.delivered = delivered;
     m.ts = ts;
+    m.media[0] = 0;
     chatScroll_ = 0;               // новое сообщение прижимает ленту к свежему краю
     if (current_ == SCR_CHAT && !emojiOpen_) drawChatArea();
 }
+
+void addVoiceMessage(const char* path, int seconds, bool mine, bool delivered) {
+    if (msgCount_ == kMaxMsgs) {
+        memmove(msgs_, msgs_ + 1, sizeof(Msg) * (kMaxMsgs - 1));
+        --msgCount_;
+    }
+    Msg& m = msgs_[msgCount_++];
+    snprintf(m.text, sizeof(m.text), "Голосовое · %d с", seconds);
+    m.mine = mine;
+    m.delivered = delivered;
+    m.ts = 0;
+    snprintf(m.media, sizeof(m.media), "%s", path ? path : "");
+    chatScroll_ = 0;
+    if (current_ == SCR_CHAT && !emojiOpen_) drawChatArea();
+}
+
+const char* voiceAt(int index) {
+    if (index < 0 || size_t(index) >= msgCount_) return "";
+    return msgs_[size_t(index)].media;
+}
+
+namespace {
+/** Какое сообщение лежит под точкой y ленты. Проходит раскладку так же, как отрисовка, —
+ *  иначе попадание и картинка разойдутся. -1 — точка мимо пузырей. */
+int messageAtY(int y) {
+    const int bottom = chatBottomY();
+    WLine ls[kMaxWrap];
+    int yBottom = bottom + chatScroll_;
+    for (size_t k = msgCount_; k-- > 0; ) {
+        int w, h;
+        msgExtent(msgs_[k], ls, w, h);
+        const int yTop = yBottom - h;
+        if (y >= yTop && y <= yBottom) return int(k);
+        if (yBottom < kHeaderH) break;
+        yBottom = yTop - kBubbleGap;
+    }
+    return -1;
+}
+}  // namespace
 
 void clearMessages() {
     msgCount_ = 0;
@@ -830,11 +923,13 @@ Rect layoutBadgeRect() {
 
 // ── список ─────────────────────────────────────────────────────────────────────────────
 
-void setPeers(const char* const* names, const bool* online, size_t count, size_t selected) {
+void setPeers(const char* const* names, const bool* online, size_t count, size_t selected,
+              const uint8_t* unread) {
     peerCount_ = count > kMaxPeers ? kMaxPeers : count;
     for (size_t i = 0; i < peerCount_; ++i) {
         peerNames_[i]  = names[i];
         peerOnline_[i] = online[i];
+        peerUnread_[i] = unread ? unread[i] : 0;
     }
     peerSel_ = selected < peerCount_ ? selected : 0;
     if (deleteArm_ >= int(peerCount_)) deleteArm_ = -1;
@@ -1246,8 +1341,8 @@ HitResult hitTest(Screen s, int16_t x, int16_t y) {
             const int idx = emoji::pickerHit(emojiTop_, x, y);
             return idx >= 0 ? HitResult{HIT_EMOJI_CELL, idx} : HitResult{HIT_NONE, -1};
         }
-        // Остальное — сама лента: по ней проигрывают голосовые.
-        if (y >= kHeaderH) return HitResult{HIT_ROW, 0};
+        // Остальное — сама лента: касание голосового пузыря проигрывает именно его.
+        if (y >= kHeaderH) return HitResult{HIT_ROW, messageAtY(y)};
         return HitResult{HIT_NONE, -1};
 
     case SCR_CHATS: {

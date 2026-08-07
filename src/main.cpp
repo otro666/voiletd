@@ -231,6 +231,9 @@ static void pumpQueue() {
 
 static ui::Screen screen_ = ui::SCR_CHATS;
 static size_t     selected_ = 0;
+/** Непрочитанное по собеседникам. Живёт рядом с интерфейсом, а не в контактах:
+ *  это состояние экрана, и переживать перезагрузку ему незачем. */
+static uint8_t    unread_[17] = {};
 // Первым выделен пункт личности: без неё ничего остального не работает, и человек
 // должен упереться в неё сразу.
 static ui::MenuItem menuSel_ = ui::MENU_IDENTITY;
@@ -259,6 +262,8 @@ static void bridgeNetToRadio(const uint8_t meetAddr[4], const uint8_t* payload, 
 static void announceRadio();
 static void refreshPeers();
 static void refreshPeersIfChanged();
+static int  contactIndex(contacts::Contact* c);
+static void deliverText(contacts::Contact* c, const char* who, const char* text);
 static void bridgeRadioToNet(const uint8_t meetAddr[4], const uint8_t* payload, size_t len);
 
 static void handlePacket() {
@@ -390,8 +395,7 @@ static void handlePacket() {
 
         contacts::Contact* c = contacts::byAddr(h.src);
         const char* who = c ? c->name : "неизвестный";
-        ui::addMessage(text, false, uint32_t(millis() / 1000), true);
-        store::appendMessage(who, false, uint32_t(time(nullptr)), text);
+        deliverText(c, who, text);
         contacts::markSeen(h.src, false, millis());
         refreshPeersIfChanged();
 
@@ -437,6 +441,33 @@ static void showWifiList(const char* status) {
 static char       draft_[160] = {};
 static size_t     draftLen_ = 0;
 
+/** Номер контакта в списке — для счётчиков непрочитанного. */
+static int contactIndex(contacts::Contact* c) {
+    for (size_t i = 0; i < contacts::count() && i < 16; ++i)
+        if (contacts::at(i) == c) return int(i);
+    return -1;
+}
+
+/**
+ * Единый путь входящего текста: с радио и из сети сообщение проходит одинаково.
+ *
+ * В ленту оно попадает ТОЛЬКО если открыта переписка именно с отправителем — раньше
+ * входящее вливалось в любой открытый чат и путало переписки. Иначе — счётчик
+ * непрочитанного у строки собеседника. На карту пишется всегда: история не зависит от
+ * того, куда смотрел человек. И звук — как в телефоне.
+ */
+static void deliverText(contacts::Contact* c, const char* who, const char* text) {
+    const bool inThisChat = screen_ == ui::SCR_CHAT && c && contacts::at(selected_) == c;
+    if (inThisChat) {
+        ui::addMessage(text, false, uint32_t(millis() / 1000), true);
+    } else if (c) {
+        const int idx = contactIndex(c);
+        if (idx >= 0 && unread_[idx] < 255) ++unread_[idx];
+    }
+    if (sdOk_) store::appendMessage(who, false, uint32_t(time(nullptr)), text);
+    audio::device::chime();
+}
+
 /** Сколько молчания терпим, прежде чем считать собеседника ушедшим из эфира.
  *  Объявления в покое уходят раз в две минуты — три пропущенных подряд уже не случайность. */
 constexpr uint32_t kPresenceMs = 390000;
@@ -453,7 +484,7 @@ static void refreshPeers() {
         online[i] = c && (c->viaWifi || c->viaLora) && c->lastSeenMs != 0 &&
                     millis() - c->lastSeenMs < kPresenceMs;
     }
-    ui::setPeers(names, online, n, selected_);
+    ui::setPeers(names, online, n, selected_, unread_);
 }
 
 /** Пересчитать присутствие и перерисовать список, только если что-то поменялось:
@@ -468,6 +499,7 @@ static void refreshPeersIfChanged() {
         const bool on = c && (c->viaWifi || c->viaLora) && c->lastSeenMs != 0 &&
                         millis() - c->lastSeenMs < kPresenceMs;
         if (on) state |= 1u << i;
+        state += uint32_t(unread_[i]) * 131u;   // счётчики тоже часть картинки
     }
     if (state == lastState_) return;
     lastState_ = state;
@@ -498,6 +530,15 @@ static void sendDraft() {
     // Копии с разнесением во времени и по частоте — главное средство против городских
     // переотражений: три копии дают эффект прибавки 14 дБ мощности.
     enqueue(pkt, hl + n, voile::kDefaultCopies);
+
+    // И в сеть тоже: собеседник на Wi-Fi (телефон в той же сети) иначе не получает
+    // НИЧЕГО — отправка была радио-только, хотя приём из сети работал. Дубль не
+    // страшен: получатель отсеивает повторы, а недошедшее по одному пути догонит
+    // другой.
+    for (size_t i = 0; i < net::neighbourCount(); ++i) {
+        const net::Neighbour* nb = net::neighbourAt(i);
+        if (nb) net::sendTo(nb->id, reinterpret_cast<const uint8_t*>(draft_), n);
+    }
 
     ui::addMessage(draft_, true, millis() / 1000, false);
     // Сохраняем и своё: иначе история была бы односторонней — видно, что отвечали, а
@@ -781,13 +822,18 @@ static void onNetFrame(const uint8_t id[20], const uint8_t* data, size_t len) {
 
     if (data[0] == 'X') { xfer::onChunk(who, data, len, xfer::R_NET); return; }
 
-    // Обычное сообщение: показываем в ленте и сохраняем на карту.
+    // Обычное сообщение — общим путём: лента или непрочитанные, звук, карта.
     static char text[256];
     const size_t n = len < sizeof(text) - 1 ? len : sizeof(text) - 1;
     memcpy(text, data, n);
     text[n] = 0;
-    ui::addMessage(text, false, uint32_t(millis() / 1000), true);
-    store::appendMessage(who, false, uint32_t(time(nullptr)), text);
+    contacts::Contact* c = nullptr;
+    for (size_t i = 0; i < contacts::count(); ++i) {
+        contacts::Contact* k = contacts::at(i);
+        if (k && strcmp(k->name, who) == 0) { c = k; break; }
+    }
+    deliverText(c, who, text);
+    refreshPeers();
 }
 
 /** Последнее принятое голосовое — его и проигрываем по нажатию. */
@@ -801,8 +847,31 @@ static void onFileReady(const char* peer, const char* path, xfer::Kind kind, boo
     const char* what = kind == xfer::K_VOICE ? "голосовое"
                      : (kind == xfer::K_PHOTO ? "снимок" : "файл");
     if (incoming) {
-        ui::addMessage(what, false, uint32_t(millis() / 1000), true);
-        store::appendMessage(peer, false, uint32_t(time(nullptr)), what);
+        if (kind == xfer::K_VOICE) {
+            // Длительность — из размера файла: 8000 отсчётов в секунду, по полбайта
+            // на отсчёт после сжатия.
+            int secs = 0;
+            File f = SD.open(path, FILE_READ);
+            if (f) { secs = int((f.size() > 12 ? f.size() - 12 : 0) * 2 / 8000); f.close(); }
+            contacts::Contact* c = nullptr;
+            for (size_t i = 0; i < contacts::count(); ++i) {
+                contacts::Contact* k = contacts::at(i);
+                if (k && strcmp(k->name, peer) == 0) { c = k; break; }
+            }
+            const bool inThisChat = screen_ == ui::SCR_CHAT && c &&
+                                    contacts::at(selected_) == c;
+            if (inThisChat) ui::addVoiceMessage(path, secs, false, true);
+            else if (c) {
+                const int idx = contactIndex(c);
+                if (idx >= 0 && unread_[idx] < 255) ++unread_[idx];
+                refreshPeers();
+            }
+            audio::device::chime();
+        } else {
+            ui::addMessage(what, false, uint32_t(millis() / 1000), true);
+        }
+        store::appendMessage(peer, false, uint32_t(time(nullptr)),
+                             kind == xfer::K_VOICE ? "🎤 голосовое" : what);
     } else {
         // Своё сообщение «голосовое» уже стоит в ленте с момента записи — добавлять
         // второе нельзя, их и так путали. Завершение передачи даёт ему вторую галочку.
@@ -918,6 +987,7 @@ static void onHistoryLine(bool mine, uint32_t ts, const char* text) {
 static void openChat(size_t idx) {
     selected_ = idx;
     screen_ = ui::SCR_CHAT;
+    if (idx < 16) unread_[idx] = 0;   // вошёл — значит прочитал
     // Чистим ленту ОБЯЗАТЕЛЬНО: иначе к истории этого собеседника примешивались бы
     // сообщения предыдущего — лента общая, а переписки разные.
     ui::clearMessages();
@@ -1003,9 +1073,12 @@ static void stopVoice() {
     contacts::Contact* c = contacts::at(selected_);
     if (!c) { store::log("voice", "некому отправлять"); return; }
 
-    // По сети, если собеседник виден там: минута голосового уходит за секунды. По радио
-    // та же минута заняла бы около трёх минут эфира, и молча занимать его нельзя.
-    const bool viaNet = net::neighbourCount() > 0;
+    // Маршрут выбирается ПО СОБЕСЕДНИКУ, а не по наличию сети вообще. Прежде «есть
+    // хоть один сосед по сети» отправляло голосовое в сеть — даже когда адресат жил
+    // только в эфире, — и оно улетало кому угодно, кроме него.
+    const bool loraFresh = c->viaLora && c->lastSeenMs != 0 &&
+                           millis() - c->lastSeenMs < kPresenceMs;
+    const bool viaNet = !loraFresh && net::neighbourCount() > 0;
     const xfer::Route route = viaNet ? xfer::R_NET : xfer::R_RADIO;
 
     if (!viaNet) {
@@ -1021,7 +1094,9 @@ static void stopVoice() {
         snprintf(msg, sizeof(msg), "голосовое %lu мс отправляется по %s",
                  (unsigned long)ms, viaNet ? "сети" : "радио");
         store::log("voice", msg);
-        ui::addMessage("голосовое", true, uint32_t(millis() / 1000), false);
+        ui::addVoiceMessage(voicePath_, int(ms / 1000), true, false);
+        if (sdOk_) store::appendMessage(c->name, true, uint32_t(time(nullptr)),
+                                        "🎤 голосовое");
     }
 }
 

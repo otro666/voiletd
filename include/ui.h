@@ -170,6 +170,13 @@ void drawStatus2(const Status& st, const char* ip, bool radioOk, bool sdOk);
 /** Добавить сообщение в текущую переписку. */
 void addMessage(const char* text, bool mine, uint32_t ts, bool delivered);
 
+/** Добавить ГОЛОСОВОЕ: пузырь с кнопкой проигрывания. path — файл на карте,
+ *  seconds — длительность для подписи. Нажатие на пузырь проигрывает именно его. */
+void addVoiceMessage(const char* path, int seconds, bool mine, bool delivered);
+
+/** Путь к голосовому по номеру сообщения из hitTest; пусто — сообщение не голосовое. */
+const char* voiceAt(int index);
+
 /** Очистить ленту. Обязательно при открытии другой переписки: без этого сообщения
  *  разных собеседников перемешивались в одной ленте. */
 void clearMessages();
@@ -230,7 +237,9 @@ int  armedDelete();          // какой ряд взведён; -1 — ник�
 struct Rect { int16_t x, y, w, h; };
 Rect layoutBadgeRect();
 
-/** Список собеседников. */
-void setPeers(const char* const* names, const bool* online, size_t count, size_t selected);
+/** Список собеседников. unread — счётчики непрочитанного (можно nullptr): у строки с
+ *  ненулевым счётчиком рисуется акцентный кружок с числом — как в любом мессенджере. */
+void setPeers(const char* const* names, const bool* online, size_t count, size_t selected,
+              const uint8_t* unread = nullptr);
 
 }  // namespace ui

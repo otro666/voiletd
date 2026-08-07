@@ -100,6 +100,10 @@ void pumpPlayback();
 void stopPlayback();
 bool isPlaying();
 
+/** Сигнал входящего сообщения: два коротких тона. Молчит, пока идёт запись или
+ *  проигрывание. */
+void chime();
+
 }  // namespace device
 
 }  // namespace audio
