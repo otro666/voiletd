@@ -87,6 +87,11 @@ void begin() {
 void step(const char* name) {
     if (haveStep) done(OK);          // предыдущий не закрыли — считаем удачным
 
+    // Маячок в аппаратный порт. Обычный Serial на этой плате уходит в USB, и в мониторе
+    // на UART его не видно — а когда плата падает в перезагрузку, ИМЕННО названия этапов
+    // и говорят, где именно. ets_printf пишет в UART0 всегда, до и помимо всего.
+    ets_printf("[vual] шаг: %s\n", name ? name : "?");
+
     snprintf(lastName, sizeof(lastName), "%s", name ? name : "");
     haveStep = true;
 

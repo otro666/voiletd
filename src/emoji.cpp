@@ -88,13 +88,19 @@ bool bake(size_t index) {
     const int w = (raw[16] << 24) | (raw[17] << 16) | (raw[18] << 8) | raw[19];
     const int h = (raw[20] << 24) | (raw[21] << 16) | (raw[22] << 8) | raw[23];
     if (w < kSize || h < kSize || w > 144 || h > 144) return false;
+    ets_printf("[vual] эмодзи: %s, %d x %d\n", path, w, h);
 
     // Две развёртки одной картинки: на чёрном и на белом — из них восстанавливается
     // прозрачность каждой точки.
     LGFX_Sprite black(&vualScreen()), white(&vualScreen());
     black.setColorDepth(16); white.setColorDepth(16);
-    if (!black.createSprite(w, h)) return false;
-    if (!white.createSprite(w, h)) { black.deleteSprite(); return false; }
+    // Каждый буфер ПРОВЕРЯЕТСЯ. Большая картинка — это десятки килобайт на каждую из
+    // двух развёрток; не хватило памяти — честно пропускаем картинку, а не пишем в
+    // пустоту: запись через несозданный буфер и есть перезагрузка с воплем StoreProhibited.
+    if (!black.createSprite(w, h) || !black.getBuffer()) { black.deleteSprite(); return false; }
+    if (!white.createSprite(w, h) || !white.getBuffer()) {
+        black.deleteSprite(); white.deleteSprite(); return false;
+    }
     black.fillSprite(TFT_BLACK);
     white.fillSprite(TFT_WHITE);
 
@@ -109,11 +115,11 @@ bool bake(size_t index) {
     if (swapped < 0) {
         LGFX_Sprite probe(&vualScreen());
         probe.setColorDepth(16);
-        if (probe.createSprite(1, 1)) {
+        if (probe.createSprite(1, 1) && probe.getBuffer()) {
             probe.fillSprite(uint16_t(0xF800));
             swapped = (uint16_t(probe.readPixelValue(0, 0)) == 0xF800) ? 0 : 1;
-            probe.deleteSprite();
         } else swapped = 1;
+        probe.deleteSprite();
     }
     auto rd = [&](LGFX_Sprite& s, int x, int y) -> uint16_t {
         const uint16_t v = uint16_t(s.readPixelValue(x, y));
@@ -180,12 +186,14 @@ inline uint16_t overBg(uint16_t premul, uint16_t bg, uint8_t a) {
 }  // namespace
 
 void scanCard() {
+    ets_printf("[vual] эмодзи: разворачиваю набор с карты\n");
     g_cardCount = 0;
     const uint32_t t0 = millis();
     for (size_t i = 0; i < kCount && i < 64; ++i) {
         if (bake(i)) ++g_cardCount;
     }
     g_scanned = true;
+    ets_printf("[vual] эмодзи: готово, %u из %u\n", unsigned(g_cardCount), unsigned(kCount));
     Serial.printf("эмодзи с карты: %u из %u, развёрнуто за %lu мс\n",
                   unsigned(g_cardCount), unsigned(kCount),
                   (unsigned long)(millis() - t0));
@@ -200,10 +208,15 @@ void draw(size_t index, int x, int y, uint16_t bg) {
     // на два порядка медленнее, а спрайт вдобавок избавляет от вопросов о порядке байтов.
     static LGFX_Sprite* cb = nullptr;
     if (!cb) {
-        cb = new LGFX_Sprite(&vualScreen());
-        cb->setColorDepth(16);
-        cb->createSprite(kSize, kSize);
+        cb = new (std::nothrow) LGFX_Sprite(&vualScreen());
+        if (cb) {
+            cb->setColorDepth(16);
+            cb->createSprite(kSize, kSize);
+        }
     }
+    // Буфер мог не создаться — рисуем тогда прямо в экран, точка за точкой. Медленнее,
+    // но рисует, а не пишет в пустоту.
+    const bool fast = cb && cb->getBuffer();
     static uint16_t out[kSize * kSize];
 
     // Картинка с карты: плавная прозрачность восстановлена при развёртке, смешивание
@@ -213,9 +226,11 @@ void draw(size_t index, int x, int y, uint16_t bg) {
         for (int i = 0; i < kSize * kSize; ++i)
             out[i] = b->alpha[i] ? overBg(b->onBlack[i], bg, b->alpha[i]) : bg;
         for (int row = 0; row < kSize; ++row)
-            for (int col = 0; col < kSize; ++col)
-                cb->drawPixel(col, row, out[row * kSize + col]);
-        cb->pushSprite(x, y);
+            for (int col = 0; col < kSize; ++col) {
+                if (fast) cb->drawPixel(col, row, out[row * kSize + col]);
+                else vualScreen().drawPixel(x + col, y + row, out[row * kSize + col]);
+            }
+        if (fast) cb->pushSprite(x, y);
         return;
     }
 
@@ -227,9 +242,11 @@ void draw(size_t index, int x, int y, uint16_t bg) {
     for (int i = 0; i < kSize * kSize; ++i)
         out[i] = rom.alpha[i] ? overBg(rom.premul[i], bg, rom.alpha[i]) : bg;
     for (int row = 0; row < kSize; ++row)
-        for (int col = 0; col < kSize; ++col)
-            cb->drawPixel(col, row, out[row * kSize + col]);
-    cb->pushSprite(x, y);
+        for (int col = 0; col < kSize; ++col) {
+            if (fast) cb->drawPixel(col, row, out[row * kSize + col]);
+            else vualScreen().drawPixel(x + col, y + row, out[row * kSize + col]);
+        }
+    if (fast) cb->pushSprite(x, y);
 }
 
 size_t match(const char* text, size_t& indexOut) {

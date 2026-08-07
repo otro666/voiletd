@@ -71,6 +71,18 @@
     font-family: inherit;
   }
   button.go:hover { background: var(--accent-light); }
+  button.go:disabled { background: var(--surface-high); color: var(--text-third);
+                       cursor: default; }
+  .pick {
+    display: inline-block;
+    background: var(--surface-high);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-size: 14.5px;
+    cursor: pointer;
+  }
+  .pick:hover { background: var(--accent); }
 
   .unsupported {
     display: block;
@@ -121,9 +133,21 @@
     перепрошивкой.</p>
   </div>
 
+  <div class="card">
+    <h2>Прошивка</h2>
+    <p id="binStatus">Ищу <kbd>vual-tdeck.bin</kbd> рядом со страницей…</p>
+    <p>
+      <label class="pick" for="binFile">Выбрать файл прошивки…</label>
+      <input type="file" id="binFile" accept=".bin" style="display:none">
+    </p>
+    <p style="font-size:13px">Файл берётся из вкладки Actions сборки — артефакт
+    <kbd>vual-tdeck</kbd>, внутри <kbd>vual-tdeck.bin</kbd>. Если положить его рядом с
+    этой страницей на хостинге, он подхватится сам.</p>
+  </div>
+
   <div class="card flash">
-    <esp-web-install-button manifest="manifest.json">
-      <button class="go" slot="activate">Прошить устройство</button>
+    <esp-web-install-button id="installer">
+      <button class="go" slot="activate" id="goBtn" disabled>Прошить устройство</button>
       <span slot="unsupported" class="unsupported">
         <strong>Этот браузер не умеет прошивать.</strong><br>
         Доступ к порту устройства есть только у Chrome и Edge на компьютере —
@@ -151,6 +175,52 @@
         if (f) f.style.display = 'block';
       }
     }, 3000);
+
+    // Откуда взять прошивку. Страница живёт на любом хостинге и не привязана к сборке:
+    // описание для заливщика составляется прямо здесь, на лету, под выбранный источник.
+    // Пути в нём — только АБСОЛЮТНЫЕ: описание отдаётся как blob-ссылка, а от неё
+    // относительные пути не отсчитываются.
+    (function () {
+      var status = document.getElementById('binStatus');
+      var installer = document.getElementById('installer');
+      var goBtn = document.getElementById('goBtn');
+
+      function human(bytes) {
+        return bytes > 0 ? (bytes / 1048576).toFixed(1) + ' МБ' : '';
+      }
+
+      function useSource(url, label) {
+        var manifest = {
+          name: 'Вуаль для T-Deck',
+          version: 'alpha',
+          new_install_prompt_erase: true,
+          builds: [{ chipFamily: 'ESP32-S3', parts: [{ path: url, offset: 0 }] }]
+        };
+        installer.manifest = URL.createObjectURL(
+          new Blob([JSON.stringify(manifest)], { type: 'application/json' }));
+        goBtn.disabled = false;
+        status.innerHTML = 'Прошивка: <strong>' + label + '</strong>';
+      }
+
+      // Сначала пробуем файл рядом со страницей: положил vual-tdeck.bin на хостинг —
+      // и никакой возни с выбором.
+      fetch('vual-tdeck.bin', { method: 'HEAD' }).then(function (r) {
+        if (!r.ok) throw 0;
+        var size = human(+(r.headers.get('content-length') || 0));
+        useSource(new URL('vual-tdeck.bin', location.href).href,
+                  'vual-tdeck.bin рядом со страницей' + (size ? ' · ' + size : ''));
+      }).catch(function () {
+        status.innerHTML = 'Рядом со страницей файла нет — выберите его вручную.';
+      });
+
+      // Ручная подгрузка перекрывает найденное: человек выбрал файл — значит, хочет
+      // прошивать именно его.
+      document.getElementById('binFile').addEventListener('change', function () {
+        var f = this.files && this.files[0];
+        if (!f) return;
+        useSource(URL.createObjectURL(f), f.name + ' · ' + human(f.size));
+      });
+    })();
   </script>
 
   <div class="card">
