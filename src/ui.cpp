@@ -1313,6 +1313,11 @@ void drawStatus2(const Status& st, const char* ip, bool radioOk, bool sdOk) {
 
     snprintf(buf, sizeof(buf), "%d%%", int(st.battery));
     line("Заряд", buf, st.battery < 20 ? kWarning : kTextPrimary);
+
+    // Штамп сборки: по нему сверяют, что в плате именно та прошивка, которую собрали, —
+    // а не прошлогодний файл, приблудившийся на хостинге рядом со страницей заливки.
+    snprintf(buf, sizeof(buf), "%s %s", __DATE__, __TIME__);
+    line("Сборка", buf, kTextTertiary);
 }
 
 // ── касания ────────────────────────────────────────────────────────────────────────────
