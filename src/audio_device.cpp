@@ -55,7 +55,12 @@ bool begin() {
     cfg.mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX);
     cfg.sample_rate = kSampleRate;
     cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-    cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;   // моно: речь, стерео ни к чему
+    // СТЕРЕО, а не «только левый». Микрофон и усилитель на этой плате раскладывают
+    // данные по слотам кадра по-своему, и однослотовый режим отдавал динамику кашу из
+    // половинок отсчётов — мелодия при старте звучала «короткой помехой». В стерео мы
+    // сами кладём отсчёт в ОБА слота на выходе и сами складываем оба слота на входе —
+    // и раскладка слотов перестаёт быть нашей проблемой.
+    cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
     cfg.dma_buf_count = 4;
@@ -112,11 +117,16 @@ void pumpRecording() {
     // остановило бы весь интерфейс — а он должен рисовать полоску записи.
     if (i2s_read(kPort, g_pcm, sizeof(g_pcm), &got, 0) != ESP_OK || got == 0) return;
 
+    // Из стерео-кадров в моно: голос лежит в одном из слотов (в каком — зависит от
+    // платы), сумма обоих ловит его в любом случае, а пустой слот добавляет ноль.
+    const size_t frames = got / (2 * sizeof(int16_t));
+    for (size_t i = 0; i < frames; ++i)
+        g_pcm[i] = int16_t((int32_t(g_pcm[i * 2]) + g_pcm[i * 2 + 1]) / 2);
+
     // Прореживание вдвое усреднением пар: шина даёт 16 кГц, в файл идёт 8. Усреднение,
     // а не выбрасывание каждого второго: выброшенные отсчёты возвращаются свистом на
     // высоких — это зовётся наложением, и лечится оно именно усреднением.
-    const size_t n = got / sizeof(int16_t);
-    const size_t half = n / 2;
+    const size_t half = frames / 2;
     for (size_t i = 0; i < half; ++i)
         g_pcm[i] = int16_t((int32_t(g_pcm[i * 2]) + g_pcm[i * 2 + 1]) / 2);
     const size_t bytes = adpcmEncode(g_encState, g_pcm, half, g_packed);
@@ -165,23 +175,30 @@ bool play(const char* path) {
 
 void pumpPlayback() {
     if (!g_play) return;
-    // Половина буфера: развёрнутый и раздвоенный звук должен помещаться в тот же g_pcm.
-    const int read = g_file.read(g_packed, sizeof(g_packed) / 2);
+    // Четверть буфера сжатого: после развёртки каждый отсчёт займёт ЧЕТЫРЕ места —
+    // дважды по времени (8 кГц файла против 16 кГц шины) и в оба слота стерео-кадра.
+    const int read = g_file.read(g_packed, sizeof(g_packed) / 4);
     if (read <= 0) { stopPlayback(); return; }
 
     const size_t n = adpcmDecode(g_decState, g_packed, size_t(read), g_pcm);
     size_t written = 0;
     if (g_playRate <= kVoiceRate) {
-        // Файл на 8 кГц, шина на 16: каждый отсчёт дважды, с усилением.
         for (size_t i = n; i-- > 0; ) {
             const int16_t v = amplify(g_pcm[i]);
-            g_pcm[i * 2] = v;
+            g_pcm[i * 4]     = v;
+            g_pcm[i * 4 + 1] = v;
+            g_pcm[i * 4 + 2] = v;
+            g_pcm[i * 4 + 3] = v;
+        }
+        i2s_write(kPort, g_pcm, n * 4 * sizeof(int16_t), &written, portMAX_DELAY);
+    } else {
+        // Старый файл на 16 кГц: только раздвоение по слотам.
+        for (size_t i = n; i-- > 0; ) {
+            const int16_t v = amplify(g_pcm[i]);
+            g_pcm[i * 2]     = v;
             g_pcm[i * 2 + 1] = v;
         }
         i2s_write(kPort, g_pcm, n * 2 * sizeof(int16_t), &written, portMAX_DELAY);
-    } else {
-        for (size_t i = 0; i < n; ++i) g_pcm[i] = amplify(g_pcm[i]);
-        i2s_write(kPort, g_pcm, n * sizeof(int16_t), &written, portMAX_DELAY);
     }
 }
 
@@ -209,16 +226,21 @@ void bootMelody() {
         const int total = kSampleRate * nt.ms / 1000;
         int made = 0;
         while (made < total) {
-            const int n = (total - made) < int(kChunk) ? (total - made) : int(kChunk);
+            // Пары на каждый отсчёт: буфер вмещает вдвое меньше моно-отсчётов.
+            const int cap = int(kChunk) / 2;
+            const int n = (total - made) < cap ? (total - made) : cap;
             for (int i = 0; i < n; ++i) {
                 const float t = float(made + i);
                 const float env = 1.0f - t / float(total);
                 const float v = sinf(6.2831853f * nt.a * t / kSampleRate) +
                                 0.6f * sinf(6.2831853f * nt.b * t / kSampleRate);
-                g_pcm[i] = int16_t(6500.0f * env * v);
+                const int16_t sv = int16_t(6500.0f * env * v);
+                g_pcm[i * 2]     = sv;
+                g_pcm[i * 2 + 1] = sv;
             }
             size_t written = 0;
-            i2s_write(kPort, g_pcm, size_t(n) * sizeof(int16_t), &written, portMAX_DELAY);
+            i2s_write(kPort, g_pcm, size_t(n) * 2 * sizeof(int16_t), &written,
+                      portMAX_DELAY);
             made += n;
         }
     }
@@ -236,16 +258,20 @@ void chime() {
         const int total = kSampleRate * nt.ms / 1000;
         int made = 0;
         while (made < total) {
-            const int n = (total - made) < int(kChunk) ? (total - made) : int(kChunk);
+            const int cap = int(kChunk) / 2;      // пары: моно-отсчётов вдвое меньше
+            const int n = (total - made) < cap ? (total - made) : cap;
             for (int i = 0; i < n; ++i) {
                 const float t = float(made + i);
                 // Плавный спад к концу ноты, чтобы не щёлкало на границе.
                 const float env = 1.0f - t / float(total);
-                g_pcm[i] = int16_t(9000.0f * env *
+                const int16_t sv = int16_t(9000.0f * env *
                                    sinf(6.2831853f * nt.hz * t / kSampleRate));
+                g_pcm[i * 2]     = sv;
+                g_pcm[i * 2 + 1] = sv;
             }
             size_t written = 0;
-            i2s_write(kPort, g_pcm, size_t(n) * sizeof(int16_t), &written, portMAX_DELAY);
+            i2s_write(kPort, g_pcm, size_t(n) * 2 * sizeof(int16_t), &written,
+                      portMAX_DELAY);
             made += n;
         }
     }

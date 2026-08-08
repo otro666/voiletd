@@ -437,6 +437,7 @@ static void handlePacketInner() {
         voile::Header a{};
         a.type = voile::FT_ACK;
         memcpy(a.dst, h.src, 4);
+        contacts::myAddr(a.src);       // и подтверждение тоже называет отправителя
         a.seq = h.seq;
         a.part = voile::packPart(0, 1);
         a.copy = voile::packPart(0, 1);
@@ -501,6 +502,11 @@ static void deliverText(contacts::Contact* c, const char* who, const char* text)
     const bool saved = sdOk_ && store::appendMessage(who, false, uint32_t(time(nullptr)), text);
     ets_printf("[vual] входящее от «%s»: %s\n", who,
                saved ? "записано в историю" : "НЕ записано (карта?)");
+    {
+        char l[64];
+        snprintf(l, sizeof(l), "принято от «%s»%s", who, saved ? "" : " — НЕ записано");
+        store::log("msg", l);
+    }
     // Звон — НЕ здесь. Мы в пути приёма радио: четверть секунды звука здесь — это
     // задержанное подтверждение и потерянные копии. Флаг, а звенит главный цикл.
     chimePending_ = true;
@@ -556,6 +562,13 @@ static void sendDraft() {
     voile::Header h{};
     h.type = voile::FT_MSG;
     memcpy(h.dst, c->addr, 4);
+    // СВОЙ адрес — обязателен. Без него кадр уходил с отправителем 00:00:00:00:
+    // доставке это не мешало (потому и не замечалось), но получатель не мог понять,
+    // ОТ КОГО кадр: историю писал в файл «неизвестный» — и чужие сообщения «пропадали»
+    // после перезахода, присутствие не отмечалось — и все были «не в сети», а куски
+    // голосовых складывались под именем «?», путь из которого не открывался, — и
+    // выбрасывались молча, без единой строки в журнале.
+    contacts::myAddr(h.src);
     h.seq = nextSeq();
     h.part = voile::packPart(0, 1);
     h.copy = voile::packPart(0, voile::kDefaultCopies);
@@ -618,6 +631,7 @@ static bool radioSendChunk(const char* peer, const uint8_t* data, size_t len) {
     voile::Header h{};
     h.type = voile::FT_MSG;
     memcpy(h.dst, c->addr, 4);
+    contacts::myAddr(h.src);           // тот же закон: кадр обязан назвать отправителя
     h.seq = nextSeq();
     h.part = voile::packPart(0, 1);
     // Кускам — ДВЕ копии вместо трёх. Потеря куска и так редка при разнесении, а третья
