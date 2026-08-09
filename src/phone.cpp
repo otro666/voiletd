@@ -216,6 +216,68 @@ mbedtls_entropy_context  g_entropy;
  * путь не зависит от версии библиотеки, а разбор 65 байт тривиален — метка 0x04, затем
  * две координаты по 32 байта.
  */
+/**
+ * Разжать точку арифметикой, без помощи библиотеки.
+ *
+ * mbedTLS ветки 2 читать СЖАТЫЕ точки не умеет вовсе — возвращает «возможность
+ * недоступна». А личность на плате хранится именно сжатой, и телефону нужны обе
+ * координаты. Считаем сами: y² = x³ − 3x + b по модулю p, затем корень возведением в
+ * степень (p+1)/4 — это работает, потому что у P-256 остаток p по модулю 4 равен трём.
+ * Знак выбираем по первому байту, как принято: 0x02 — чётный y, 0x03 — нечётный.
+ */
+bool decompressManual(const uint8_t comp[33], uint8_t x[32], uint8_t y[32]) {
+    if (comp[0] != 0x02 && comp[0] != 0x03) return false;
+
+    mbedtls_ecp_group grp;
+    mbedtls_mpi X, Y, T, E;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_mpi_init(&X); mbedtls_mpi_init(&Y);
+    mbedtls_mpi_init(&T); mbedtls_mpi_init(&E);
+    bool ok = false;
+    do {
+        if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) != 0) break;
+        if (mbedtls_mpi_read_binary(&X, comp + 1, 32) != 0) break;
+
+        // T = x³ − 3x + b  (mod p)
+        if (mbedtls_mpi_mul_mpi(&T, &X, &X) != 0) break;
+        if (mbedtls_mpi_mod_mpi(&T, &T, &grp.P) != 0) break;
+        if (mbedtls_mpi_mul_mpi(&T, &T, &X) != 0) break;
+        if (mbedtls_mpi_mod_mpi(&T, &T, &grp.P) != 0) break;
+        if (mbedtls_mpi_mul_int(&Y, &X, 3) != 0) break;
+        if (mbedtls_mpi_sub_mpi(&T, &T, &Y) != 0) break;
+        if (mbedtls_mpi_add_mpi(&T, &T, &grp.B) != 0) break;
+        if (mbedtls_mpi_mod_mpi(&T, &T, &grp.P) != 0) break;
+
+        // Y = T^((p+1)/4) mod p
+        if (mbedtls_mpi_add_int(&E, &grp.P, 1) != 0) break;
+        if (mbedtls_mpi_shift_r(&E, 2) != 0) break;
+        if (mbedtls_mpi_exp_mod(&Y, &T, &E, &grp.P, nullptr) != 0) break;
+
+        // Проверяем, что корень настоящий: иначе точка не на кривой.
+        mbedtls_mpi chk;
+        mbedtls_mpi_init(&chk);
+        bool onCurve = false;
+        if (mbedtls_mpi_mul_mpi(&chk, &Y, &Y) == 0 &&
+            mbedtls_mpi_mod_mpi(&chk, &chk, &grp.P) == 0) {
+            onCurve = mbedtls_mpi_cmp_mpi(&chk, &T) == 0;
+        }
+        mbedtls_mpi_free(&chk);
+        if (!onCurve) break;
+
+        if ((mbedtls_mpi_get_bit(&Y, 0) != 0) != ((comp[0] & 1) != 0)) {
+            if (mbedtls_mpi_sub_mpi(&Y, &grp.P, &Y) != 0) break;
+        }
+
+        if (mbedtls_mpi_write_binary(&X, x, 32) != 0) break;
+        if (mbedtls_mpi_write_binary(&Y, y, 32) != 0) break;
+        ok = true;
+    } while (false);
+    mbedtls_mpi_free(&E); mbedtls_mpi_free(&T);
+    mbedtls_mpi_free(&Y); mbedtls_mpi_free(&X);
+    mbedtls_ecp_group_free(&grp);
+    return ok;
+}
+
 bool uncompress(const uint8_t comp[33], uint8_t x[32], uint8_t y[32]) {
     mbedtls_ecp_group grp;
     mbedtls_ecp_point pt;
@@ -224,7 +286,12 @@ bool uncompress(const uint8_t comp[33], uint8_t x[32], uint8_t y[32]) {
     bool ok = false;
     do {
         if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) != 0) break;
-        if (mbedtls_ecp_point_read_binary(&grp, &pt, comp, 33) != 0) break;
+        // Ветка 2 сжатые точки не читает: тогда считаем координаты сами.
+        if (mbedtls_ecp_point_read_binary(&grp, &pt, comp, 33) != 0) {
+            mbedtls_ecp_point_free(&pt);
+            mbedtls_ecp_group_free(&grp);
+            return decompressManual(comp, x, y);
+        }
         uint8_t raw[65];
         size_t olen = 0;
         if (mbedtls_ecp_point_write_binary(&grp, &pt, MBEDTLS_ECP_PF_UNCOMPRESSED,
@@ -311,21 +378,32 @@ size_t cardTranscript(char* out, size_t cap, const char* x, const char* y,
 
 /** Собрать свою визитку. Возвращает false, если нет личности или не хватило места. */
 bool buildCard() {
-    if (!contacts::haveIdentity()) return false;
+    // Каждый отказ называет СЕБЯ. Пять причин с одной общей строкой «не удалось» —
+    // это ровно та слепота, из-за которой мы неделю гадали над радио.
+    if (!contacts::haveIdentity()) { store::log("phone", "визитка: нет личности"); return false; }
 
     uint8_t x[32], y[32];
-    if (!uncompress(contacts::myPub(), x, y)) return false;
+    if (!uncompress(contacts::myPub(), x, y)) {
+        store::log("phone", "визитка: не разжалась точка личности");
+        return false;
+    }
     b64u(x, 32, g_myX, sizeof(g_myX));
     b64u(y, 32, g_myY, sizeof(g_myY));
 
-    if (!voile::genKeyPair(g_eph)) return false;
+    if (!voile::genKeyPair(g_eph)) {
+        store::log("phone", "визитка: не вышел эфемерный ключ");
+        return false;
+    }
     esp_fill_random(g_nonce, sizeof(g_nonce));
     esp_fill_random(g_oid, sizeof(g_oid));
     esp_fill_random(g_pid, sizeof(g_pid));
 
     // Эфемерный ключ телефон ждёт в формате X.509 — постоянный заголовок плюс несжатая точка.
     uint8_t ex[32], ey[32];
-    if (!uncompress(g_eph.pubComp, ex, ey)) return false;
+    if (!uncompress(g_eph.pubComp, ex, ey)) {
+        store::log("phone", "визитка: не разжался эфемерный ключ");
+        return false;
+    }
     uint8_t spki[26 + 65];
     memcpy(spki, kSpkiHead, sizeof(kSpkiHead));
     spki[26] = 0x04;
@@ -343,11 +421,11 @@ bool buildCard() {
 
     char t[768];
     const size_t tlen = cardTranscript(t, sizeof(t), g_myX, g_myY, ephB64, nonceB64, ep);
-    if (!tlen) return false;
+    if (!tlen) { store::log("phone", "визитка: транскрипт не собрался"); return false; }
 
     uint8_t sig[80];
     const size_t siglen = signTranscript(t, tlen, sig, sizeof(sig));
-    if (!siglen) return false;
+    if (!siglen) { store::log("phone", "визитка: подпись не вышла"); return false; }
     char sigB64[128];
     b64u(sig, siglen, sigB64, sizeof(sigB64));
 
@@ -355,7 +433,12 @@ bool buildCard() {
         "{\"v\":\"%s\",\"x\":\"%s\",\"y\":\"%s\",\"eph\":\"%s\",\"n\":\"%s\","
         "\"eps\":[\"%s\"],\"sig\":\"%s\"}",
         kVersion, g_myX, g_myY, ephB64, nonceB64, ep, sigB64);
-    return n > 0 && size_t(n) < sizeof(g_myCard);
+    if (n <= 0 || size_t(n) >= sizeof(g_myCard)) {
+        store::log("phone", "визитка: не поместилась");
+        return false;
+    }
+    ets_printf("[vual] визитка готова, %d байт, адрес %s\n", n, ep);
+    return true;
 }
 
 // ── ключи сессии ──────────────────────────────────────────────────────────────────────
@@ -799,7 +882,13 @@ bool sendText(const char* text) {
 
 void pump() {
     if (!g_ready) {
-        // Пробуем подняться, когда появились и личность, и сеть.
+        // Пробуем подняться, когда появились и личность, и сеть — но НЕ каждый круг:
+        // неудачная попытка каждые несколько миллисекунд забивала журнал одинаковыми
+        // строками так, что в нём было не найти ничего другого.
+        static uint32_t lastTry = 0;
+        const uint32_t now = millis();
+        if (now - lastTry < 5000) return;
+        lastTry = now;
         if (net::ready() && contacts::haveIdentity()) begin();
         return;
     }
