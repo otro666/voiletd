@@ -15,6 +15,9 @@ test:
 	@$(CXX) $(FLAGS) src/input_logic.cpp test/test_input.cpp -o /tmp/vd_input
 	@/tmp/vd_input
 	@echo
+	@$(CXX) $(FLAGS) test/test_phone.cpp -o /tmp/vd_phone
+	@/tmp/vd_phone
+	@echo
 	@$(CXX) $(FLAGS) src/contacts.cpp test/crypto_test_backend.cpp test/test_contacts.cpp -o /tmp/vd_contacts
 	@/tmp/vd_contacts
 	@echo

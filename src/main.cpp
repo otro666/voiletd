@@ -20,6 +20,7 @@
 #include "ui.h"
 #include "audio.h"
 #include "net.h"
+#include "phone.h"
 #include "rail.h"
 #include "nostr.h"
 #include "tracker.h"
@@ -475,6 +476,13 @@ static void showWifiList(const char* status) {
 static char       draft_[160] = {};
 static size_t     draftLen_ = 0;
 
+/**
+ * Текст пришёл от ТЕЛЕФОНА. Ведём его тем же путём, что и всё остальное: лента,
+ * история, звук. Отдельного пути у телефонных сообщений быть не должно — иначе они
+ * снова начнут теряться там, где обычные доходят.
+ */
+static void onPhoneText(const char* from, const char* text);
+
 /** Номер контакта в списке — для счётчиков непрочитанного. */
 static int contactIndex(contacts::Contact* c) {
     for (size_t i = 0; i < contacts::count() && i < 16; ++i)
@@ -510,6 +518,17 @@ static void deliverText(contacts::Contact* c, const char* who, const char* text)
     // Звон — НЕ здесь. Мы в пути приёма радио: четверть секунды звука здесь — это
     // задержанное подтверждение и потерянные копии. Флаг, а звенит главный цикл.
     chimePending_ = true;
+}
+
+static void onPhoneText(const char* from, const char* text) {
+    // Собеседника ищем среди контактов по имени; не нашли — показываем как «Телефон».
+    contacts::Contact* c = nullptr;
+    for (size_t i = 0; i < contacts::count(); ++i) {
+        contacts::Contact* k = contacts::at(i);
+        if (k && from && strcmp(k->name, from) == 0) { c = k; break; }
+    }
+    deliverText(c, c ? c->name : "Телефон", text);
+    refreshPeers();
 }
 
 /** Сколько молчания терпим, прежде чем считать собеседника ушедшим из эфира.
@@ -588,11 +607,19 @@ static void sendDraft() {
         return;
     }
 
-    // Дубля в сеть здесь БОЛЬШЕ НЕТ. Сетевой кадр не несёт подписи отправителя, и
-    // приёмник приписывал такой текст ПЕРВОМУ контакту в списке — сообщение оседало в
-    // чужой ленте и чужой истории, а в нужном чате «не сохранялось». Пока у сетевых
-    // кадров не появится подпись (нужна договорённость с телефонной версией), текст
-    // ходит только по радио, где отправитель известен из заголовка.
+    // И в сеть — ТЕМ ЖЕ кадром, что уже собран для эфира: с адресом отправителя в
+    // заголовке. Прежний дубль я отключал именно из-за его отсутствия — голый текст
+    // приписывался первому контакту. Теперь подпись есть, и собеседник в одной
+    // Wi-Fi-сети (вторая плата или телефон) получает текст мгновенно, не дожидаясь
+    // минутного эфира. Повторы получатель отсеет по номеру кадра.
+    for (size_t i = 0; i < net::neighbourCount(); ++i) {
+        const net::Neighbour* nb = net::neighbourAt(i);
+        if (nb) net::sendTo(nb->id, pkt, hl + n);
+    }
+
+    // И телефонной версии, если канал с ней поднят: у неё свой формат кадра, поэтому
+    // отправка идёт отдельным путём, а не тем же пакетом.
+    if (phone::linked()) phone::sendText(draft_);
 
     ui::addMessage(draft_, true, millis() / 1000, false);
     // Сохраняем и своё: иначе история была бы односторонней — видно, что отвечали, а
@@ -875,25 +902,39 @@ static void onTrackerMessage(const tracker::Incoming& in) {
 static void onNetFrame(const uint8_t id[20], const uint8_t* data, size_t len) {
     if (len == 0) return;
 
-    // Ищем имя собеседника по его узлу: сборщику нужно знать, от кого файл.
-    const char* who = "?";
-    for (size_t i = 0; i < contacts::count(); ++i) {
-        contacts::Contact* c = contacts::at(i);
-        if (c) { who = c->name; break; }
+    // Кадр из сети — ТОТ ЖЕ кадр, что и в эфире: 13 байт заголовка с адресом
+    // отправителя, дальше тело. Раньше по сети ходил голый текст без подписи, и
+    // отправителя приходилось угадывать «первым контактом» — сообщения оседали в чужой
+    // ленте и чужой истории. Единый кадр решает это и одновременно даёт телефонной
+    // версии один документированный язык на оба канала.
+    voile::Header h{};
+    if (voile::readHeader(data, len, h)) {
+        const uint8_t* body = data + voile::kHdrLen;
+        const size_t bodyLen = len - voile::kHdrLen;
+        if (h.type == voile::FT_MSG && bodyLen > 0) {
+            contacts::Contact* c = contacts::byAddr(h.src);
+            const char* who = c ? c->name : "Сеть";
+            if (c) contacts::markSeen(h.src, true, millis());
+            if (body[0] == 'X') { xfer::onChunk(who, body, bodyLen, xfer::R_NET); return; }
+            static char text[256];
+            const size_t n = bodyLen < sizeof(text) - 1 ? bodyLen : sizeof(text) - 1;
+            memcpy(text, body, n);
+            text[n] = 0;
+            deliverText(c, who, text);
+            refreshPeers();
+            return;
+        }
     }
 
+    // Старый голый формат: понимаем, пока обе платы не перепрошиты новым.
+    const char* who = "Сеть";
+    if (contacts::count() == 1 && contacts::at(0)) who = contacts::at(0)->name;
     if (data[0] == 'X') { xfer::onChunk(who, data, len, xfer::R_NET); return; }
-
-    // Обычное сообщение — общим путём: лента или непрочитанные, звук, карта.
     static char text[256];
     const size_t n = len < sizeof(text) - 1 ? len : sizeof(text) - 1;
     memcpy(text, data, n);
     text[n] = 0;
-    // Отправитель сетевого кадра НЕИЗВЕСТЕН: подписи в кадре нет. Раньше текст
-    // приписывался первому контакту — оседал в чужой ленте и чужой истории. Честнее
-    // сложить под именем «Сеть»: сообщение не потеряно, но и не выдано за чужое.
-    deliverText(nullptr, contacts::count() == 1 && contacts::at(0)
-                             ? contacts::at(0)->name : "Сеть", text);
+    deliverText(nullptr, who, text);
     refreshPeers();
 }
 
@@ -1456,6 +1497,12 @@ static void handleEvent(const input::Event& e) {
             snprintf(pairRoom_, sizeof(pairRoom_), "%s", roomHex);
             memcpy(pairWrap_, rv.wrapKey, sizeof(pairWrap_));
 
+            // Та же фраза — телефонному модулю: он выведет из неё комнату «набора»
+            // (SHA-1 "vual1-d:…") и положит туда нашу визитку. Без этого знакомство с
+            // телефоном заканчивалось на «собеседник найден»: встретиться встретились,
+            // а обменяться визитками было нечем.
+            phone::setPhrase(phrase_);
+
             rail::joinRoom(roomHex);
             rail::announce(roomHex);
             nostr::joinRoom(roomHex);
@@ -1898,6 +1945,7 @@ void setup() {
     net::setBridgeToRadio(bridgeNetToRadio);
     net::setOnFrame(onNetFrame);
     xfer::setOnComplete(onFileReady);
+    phone::setOnText(onPhoneText);
     xfer::setRadioSender(radioSendChunk);
 
     // Сохранённая сеть: подключаемся сами, не спрашивая. Пароль уже введён однажды, и
@@ -1970,6 +2018,7 @@ void loop() {
     // Сеть подаём тем же циклом: приём пакетов, рассылка объявлений о себе, поддержание
     // связей. Отдельный поток здесь только отнимал бы память.
     net::pump();
+    phone::pump();          // встреча и обмен с телефонной версией по локальной сети
     rail::pump();
     // Передачи файлов: отправка кусков и досылка.
     xfer::pump();
