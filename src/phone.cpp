@@ -4,7 +4,7 @@
 #include "cloak.h"
 #include "contacts.h"
 #include "net.h"
-#include "store.h"
+#include "store_sd.h"
 #include "voile_crypto.h"
 
 #include <Arduino.h>
@@ -13,18 +13,13 @@
 #include <string.h>
 #include <stdio.h>
 
-// Часть полей контекстов mbedTLS с версии 3 закрыта. Объявление ниже — штатный способ
-// получить к ним доступ, и оно ОБЯЗАНО стоять до включения заголовков библиотеки.
-#define MBEDTLS_ALLOW_PRIVATE_ACCESS
-
 #include <mbedtls/base64.h>
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/gcm.h>
-#include <mbedtls/sha1.h>
-#include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
 #include <esp_random.h>
 
 namespace phone {
@@ -88,13 +83,18 @@ size_t unb64u(const char* in, uint8_t* out, size_t cap) {
     return got;
 }
 
+/**
+ * Хеш через общий интерфейс mbedtls_md, а не прямыми вызовами вроде mbedtls_sha1_starts:
+ * у прямых функций имена и наличие суффикса _ret разнятся между версиями библиотеки, и
+ * код, собравшийся у меня, у вас бы не собрался. Общий интерфейс есть везде.
+ */
+void mdHash(mbedtls_md_type_t type, const uint8_t* data, size_t len, uint8_t* out) {
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(type);
+    if (info) mbedtls_md(info, data, len, out);
+}
+
 void sha1of(const uint8_t* data, size_t len, uint8_t out[20]) {
-    mbedtls_sha1_context c;
-    mbedtls_sha1_init(&c);
-    mbedtls_sha1_starts(&c);
-    mbedtls_sha1_update(&c, data, len);
-    mbedtls_sha1_finish(&c, out);
-    mbedtls_sha1_free(&c);
+    mdHash(MBEDTLS_MD_SHA1, data, len, out);
 }
 
 /**
@@ -241,8 +241,11 @@ bool uncompress(const uint8_t comp[33], uint8_t x[32], uint8_t y[32]) {
 
 /** Подписать транскрипт визитки личным ключом (ECDSA/SHA-256, подпись в DER). */
 size_t signTranscript(const char* t, size_t tlen, uint8_t* sig, size_t cap) {
+    // Подпись P-256 в DER — до 72 байт. Проверяем сами: функция записи в этой версии
+    // библиотеки ёмкость не принимает и переполнение не заметит.
+    if (cap < 72) return 0;
     uint8_t h[32];
-    mbedtls_sha256(reinterpret_cast<const uint8_t*>(t), tlen, h, 0);
+    mdHash(MBEDTLS_MD_SHA256, reinterpret_cast<const uint8_t*>(t), tlen, h);
 
     mbedtls_ecp_group grp;
     mbedtls_mpi d;
@@ -254,10 +257,12 @@ size_t signTranscript(const char* t, size_t tlen, uint8_t* sig, size_t cap) {
         if (mbedtls_mpi_read_binary(&d, contacts::myPrivMutable(), 32) != 0) break;
         mbedtls_ecdsa_context ctx;
         mbedtls_ecdsa_init(&ctx);
-        if (mbedtls_ecp_group_copy(&ctx.MBEDTLS_PRIVATE(grp), &grp) == 0 &&
-            mbedtls_mpi_copy(&ctx.MBEDTLS_PRIVATE(d), &d) == 0) {
+        if (mbedtls_ecp_group_copy(&ctx.grp, &grp) == 0 &&
+            mbedtls_mpi_copy(&ctx.d, &d) == 0) {
+            // Ёмкости буфера в этой версии подписи нет: она пишет сколько нужно, а
+            // максимум для P-256 в DER — 72 байта, под них и выделен sig у вызывающего.
             mbedtls_ecdsa_write_signature(&ctx, MBEDTLS_MD_SHA256, h, sizeof(h),
-                                          sig, cap, &n,
+                                          sig, &n,
                                           mbedtls_ctr_drbg_random, &g_drbg);
         }
         mbedtls_ecdsa_free(&ctx);
@@ -271,7 +276,7 @@ size_t signTranscript(const char* t, size_t tlen, uint8_t* sig, size_t cap) {
 bool verifyTranscript(const char* t, size_t tlen, const uint8_t x[32], const uint8_t y[32],
                       const uint8_t* sig, size_t siglen) {
     uint8_t h[32];
-    mbedtls_sha256(reinterpret_cast<const uint8_t*>(t), tlen, h, 0);
+    mdHash(MBEDTLS_MD_SHA256, reinterpret_cast<const uint8_t*>(t), tlen, h);
 
     uint8_t raw[65];
     raw[0] = 0x04;
@@ -282,9 +287,9 @@ bool verifyTranscript(const char* t, size_t tlen, const uint8_t x[32], const uin
     mbedtls_ecdsa_init(&ctx);
     bool ok = false;
     do {
-        if (mbedtls_ecp_group_load(&ctx.MBEDTLS_PRIVATE(grp), MBEDTLS_ECP_DP_SECP256R1) != 0) break;
-        if (mbedtls_ecp_point_read_binary(&ctx.MBEDTLS_PRIVATE(grp),
-                                          &ctx.MBEDTLS_PRIVATE(Q), raw, sizeof(raw)) != 0) break;
+        if (mbedtls_ecp_group_load(&ctx.grp, MBEDTLS_ECP_DP_SECP256R1) != 0) break;
+        if (mbedtls_ecp_point_read_binary(&ctx.grp,
+                                          &ctx.Q, raw, sizeof(raw)) != 0) break;
         ok = mbedtls_ecdsa_read_signature(&ctx, h, sizeof(h), sig, siglen) == 0;
     } while (false);
     mbedtls_ecdsa_free(&ctx);
