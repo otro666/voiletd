@@ -10,6 +10,7 @@
 #include <string.h>
 #include <SD.h>
 #include <driver/i2s.h>
+#include <Wire.h>
 #include <math.h>
 
 #include "board.h"
@@ -50,47 +51,123 @@ uint8_t   g_packed[kChunk / 2];
 
 }  // namespace
 
+/** Порт микрофона — отдельный от динамика: у ES7210 свои ножки. */
+constexpr i2s_port_t kMicPort = I2S_NUM_1;
+bool g_micReady = false;
+
+/** Записать регистр кодека ES7210 по I2C. */
+bool es7210Write(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(BOARD_ES7210_ADDR);
+    Wire.write(reg);
+    Wire.write(val);
+    return Wire.endTransmission() == 0;
+}
+
+/**
+ * Поднять кодек микрофона ES7210.
+ *
+ * Это отдельная микросхема со своим набором регистров: без настройки она молчит, что бы
+ * ни делал контроллер. Последовательность — минимально необходимая: сброс, тактирование
+ * в ведомом режиме (такты даём мы), формат 16 бит, питание аналоговой части, включение
+ * и усиление первых двух микрофонов.
+ */
+bool es7210Init() {
+    // Кодек вообще на шине? Молчание здесь — сразу честный отказ с маячком.
+    Wire.beginTransmission(BOARD_ES7210_ADDR);
+    if (Wire.endTransmission() != 0) {
+        ets_printf("[vual] микрофон: кодек ES7210 не отвечает по I2C\n");
+        return false;
+    }
+    bool ok = true;
+    ok &= es7210Write(0x00, 0xFF);   // полный сброс
+    delay(10);
+    ok &= es7210Write(0x00, 0x41);   // рабочее состояние
+    ok &= es7210Write(0x01, 0x1F);   // все внутренние такты включены
+    ok &= es7210Write(0x08, 0x10);   // ведомый режим: такты приходят снаружи
+    ok &= es7210Write(0x11, 0x60);   // формат данных: I2S, 16 бит
+    ok &= es7210Write(0x12, 0x00);   // обычный порядок каналов
+    ok &= es7210Write(0x40, 0x42);   // питание аналоговой части
+    ok &= es7210Write(0x41, 0x70);   // опорные цепи
+    ok &= es7210Write(0x42, 0x70);
+    ok &= es7210Write(0x43, 0x1B);   // микрофон 1: включён, усиление среднее
+    ok &= es7210Write(0x44, 0x1B);   // микрофон 2: так же
+    ok &= es7210Write(0x47, 0x08);   // смещение микрофонов
+    ok &= es7210Write(0x48, 0x08);
+    ok &= es7210Write(0x4B, 0x00);   // микрофоны 1-2 запитаны
+    ok &= es7210Write(0x4C, 0xFF);   // микрофоны 3-4 выключены — их нет на плате
+    ets_printf("[vual] микрофон: настройка %s\n", ok ? "прошла" : "СБИЛАСЬ");
+    return ok;
+}
+
 bool begin() {
-    i2s_config_t cfg = {};
-    cfg.mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX);
-    cfg.sample_rate = kSampleRate;
-    cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-    // СТЕРЕО, а не «только левый». Микрофон и усилитель на этой плате раскладывают
-    // данные по слотам кадра по-своему, и однослотовый режим отдавал динамику кашу из
-    // половинок отсчётов — мелодия при старте звучала «короткой помехой». В стерео мы
-    // сами кладём отсчёт в ОБА слота на выходе и сами складываем оба слота на входе —
-    // и раскладка слотов перестаёт быть нашей проблемой.
-    cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-    cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count = 4;
-    cfg.dma_buf_len = kFrameSamples;
-    cfg.use_apll = false;
+    // ── динамик: только передача, свои ножки ───────────────────────────────────────────
+    {
+        i2s_config_t cfg = {};
+        cfg.mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_TX);
+        cfg.sample_rate = kSampleRate;
+        cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+        // Стерео: отсчёт кладётся в оба слота, и раскладка слотов усилителя не наша забота.
+        cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+        cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+        cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+        cfg.dma_buf_count = 4;
+        cfg.dma_buf_len = kFrameSamples;
+        cfg.use_apll = false;
 
-    i2s_pin_config_t pins = {};
-    pins.bck_io_num = BOARD_I2S_BCK;
-    pins.ws_io_num = BOARD_I2S_WS;
-    pins.data_out_num = BOARD_I2S_DOUT;
-    pins.data_in_num = BOARD_I2S_DIN;
+        i2s_pin_config_t pins = {};
+        pins.bck_io_num = BOARD_SPK_BCK;
+        pins.ws_io_num = BOARD_SPK_WS;
+        pins.data_out_num = BOARD_SPK_DOUT;
+        pins.data_in_num = I2S_PIN_NO_CHANGE;
 
-    if (i2s_driver_install(kPort, &cfg, 0, nullptr) != ESP_OK) return false;
-    if (i2s_set_pin(kPort, &pins) != ESP_OK) return false;
+        if (i2s_driver_install(kPort, &cfg, 0, nullptr) != ESP_OK) return false;
+        if (i2s_set_pin(kPort, &pins) != ESP_OK) return false;
 
-    // Гасим шину сразу после настройки и держим остановленной, пока звук не нужен.
+        // Гасим шину сразу после настройки и держим остановленной, пока звук не нужен:
+        // иначе динамик непрерывно получает мусор из неочищенных буферов и шипит.
+        i2s_zero_dma_buffer(kPort);
+        i2s_stop(kPort);
+    }
+
+    // ── микрофон: отдельный порт приёма + настройка кодека ────────────────────────────
     //
-    // Без этого динамик всё время получает содержимое неочищенных буферов — то есть
-    // мусор, и плата непрерывно шипит и трещит. Заметнее всего это при работе с
-    // трекболом: прерывания идут часто, и шум становится ритмичным, будто озвучка
-    // действий. Никакой озвучки нет — это именно неубранная шина.
-    i2s_zero_dma_buffer(kPort);
-    i2s_stop(kPort);
+    // Неудача микрофона НЕ валит звук целиком: динамик важнее — без него не слышно
+    // ни мелодии, ни принятых голосовых.
+    do {
+        if (!es7210Init()) break;
+
+        i2s_config_t cfg = {};
+        cfg.mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX);
+        cfg.sample_rate = kSampleRate;
+        cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+        cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+        cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+        cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+        cfg.dma_buf_count = 4;
+        cfg.dma_buf_len = kFrameSamples;
+        cfg.use_apll = false;
+        cfg.fixed_mclk = kSampleRate * 256;   // опорная частота кодеку
+
+        i2s_pin_config_t pins = {};
+        pins.mck_io_num = BOARD_MIC_MCLK;
+        pins.bck_io_num = BOARD_MIC_SCK;
+        pins.ws_io_num = BOARD_MIC_WS;
+        pins.data_out_num = I2S_PIN_NO_CHANGE;
+        pins.data_in_num = BOARD_MIC_DIN;
+
+        if (i2s_driver_install(kMicPort, &cfg, 0, nullptr) != ESP_OK) break;
+        if (i2s_set_pin(kMicPort, &pins) != ESP_OK) break;
+        i2s_stop(kMicPort);
+        g_micReady = true;
+    } while (false);
+    if (!g_micReady) ets_printf("[vual] микрофон: НЕ поднялся — запись недоступна\n");
 
     g_ready = true;
     return true;
 }
 
 bool startRecording(const char* path) {
-    if (!g_ready || g_rec) return false;
+    if (!g_ready || !g_micReady || g_rec) return false;
     g_file = SD.open(path, FILE_WRITE);
     if (!g_file) return false;
 
@@ -105,7 +182,7 @@ bool startRecording(const char* path) {
 
     g_encState = AdpcmState{};
     g_samples = 0;
-    i2s_start(kPort);              // включаем шину только на время записи
+    i2s_start(kMicPort);           // включаем микрофонную шину только на время записи
     g_rec = true;
     return true;
 }
@@ -115,7 +192,7 @@ void pumpRecording() {
     size_t got = 0;
     // Не ждём: если данных ещё нет, выходим и вернёмся следующим кругом. Ожидание здесь
     // остановило бы весь интерфейс — а он должен рисовать полоску записи.
-    if (i2s_read(kPort, g_pcm, sizeof(g_pcm), &got, 0) != ESP_OK || got == 0) return;
+    if (i2s_read(kMicPort, g_pcm, sizeof(g_pcm), &got, 0) != ESP_OK || got == 0) return;
 
     // Из стерео-кадров в моно: голос лежит в одном из слотов (в каком — зависит от
     // платы), сумма обоих ловит его в любом случае, а пустой слот добавляет ноль.
@@ -139,8 +216,8 @@ uint32_t stopRecording() {
     g_rec = false;
 
     // Дописываем настоящее число отсчётов в заголовок.
-    i2s_zero_dma_buffer(kPort);
-    i2s_stop(kPort);               // запись кончилась — шину гасим
+    i2s_zero_dma_buffer(kMicPort);
+    i2s_stop(kMicPort);            // запись кончилась — микрофонную шину гасим
 
     const uint32_t ms = uint32_t(uint64_t(g_samples) * 1000 / kVoiceRate);
     g_file.seek(offsetof(VoiceHeader, samples));
