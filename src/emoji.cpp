@@ -1,6 +1,6 @@
 #include "emoji.h"
 #include "emoji_rom.h"
-#include "psmem.h"
+#include "psram.h"
 
 #include "display.h"
 #include "ui.h"
@@ -82,7 +82,7 @@ bool bake(size_t index) {
     // Буфер файла — во внешней памяти: 24 КБ внутренней он занимал НАВСЕГДА, хотя
     // нужен только в первые секунды после старта, пока разворачивается набор.
     static uint8_t* raw = nullptr;
-    if (!raw) raw = static_cast<uint8_t*>(psmem::bigAlloc(kRawCap, "эмодзи-файл"));
+    if (!raw) raw = static_cast<uint8_t*>(psram::bigAlloc(kRawCap, "эмодзи-файл"));
     if (!raw) { f.close(); return false; }
     const int got = f.read(raw, len);
     f.close();
@@ -137,7 +137,7 @@ bool bake(size_t index) {
 
     // Готовые картинки живут до перезагрузки — все 50 КБ набора им положено держать
     // во внешней памяти, скорость PSRAM для отрисовки за глаза.
-    Baked* b = static_cast<Baked*>(psmem::bigAlloc(sizeof(Baked), "эмодзи-набор"));
+    Baked* b = static_cast<Baked*>(psram::bigAlloc(sizeof(Baked), "эмодзи-набор"));
     if (!b) { black.deleteSprite(); white.deleteSprite(); return false; }
 
     // Ужатие усреднением по площади: каждая точка итога — среднее всех точек исходника,

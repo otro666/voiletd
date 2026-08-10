@@ -52,6 +52,18 @@ void* alloc(size_t bytes) {
     return p;
 }
 
+void* bigAlloc(size_t bytes, const char* tag) {
+    // MALLOC_CAP_8BIT обязателен: без него можно получить память, доступную только
+    // словами, и обычный побайтовый код на ней падает.
+    void* p = g_have ? heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : nullptr;
+    if (p) return p;
+
+    p = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    ets_printf("[vual] память: буфер «%s» (%u Б) — внешней не нашлось, занял внутреннюю\n",
+               tag ? tag : "?", unsigned(bytes));
+    return p;
+}
+
 uint32_t freeExternal() { return uint32_t(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)); }
 uint32_t freeInternal() { return uint32_t(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)); }
 
