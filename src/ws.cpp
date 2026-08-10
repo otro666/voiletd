@@ -89,8 +89,30 @@ bool open(Conn& c, WiFiClientSecure& cli, const char* host, uint16_t port,
     // Сертификат не проверяем: узлы публичные, содержимое защищено сверху своим слоем,
     // а хранилище сертификатов на плате пришлось бы обновлять руками.
     cli.setInsecure();
-    cli.setTimeout(4);
-    if (!cli.connect(host, port)) { c.state = CLOSED; return false; }
+    // Восемь секунд, а не четыре: рукопожатие TLS с публичным узлом на слабом канале
+    // регулярно не укладывалось в четыре, и подключение падало ДО того, как начиналось.
+    cli.setTimeout(8);
+
+    // Защищённое соединение требует десятков килобайт памяти на каждое. Когда её мало,
+    // connect() просто отвечает отказом, и снаружи это выглядит как «узлы не работают».
+    // Поэтому проверяем ЗАРАНЕЕ и говорим об этом прямо.
+    // Сообщаем в ПОРТ, а не в журнал на карте: этот код исполняется в потоках рельс на
+    // другом ядре, а карта делит шину с экраном и радио главного цикла. Одновременная
+    // запись из двух потоков — это порча файловой системы, найденная бы через неделю.
+    const uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 45000) {
+        ets_printf("[vual] %s: мало памяти (%lu Б) — не подключаюсь\n",
+                   host, (unsigned long)freeHeap);
+        c.state = CLOSED;
+        return false;
+    }
+
+    if (!cli.connect(host, port)) {
+        ets_printf("[vual] %s:%u не отвечает (свободно %lu Б)\n",
+                   host, unsigned(port), (unsigned long)ESP.getFreeHeap());
+        c.state = CLOSED;
+        return false;
+    }
 
     randomKey(c.key, sizeof(c.key));
 
@@ -131,6 +153,10 @@ bool open(Conn& c, WiFiClientSecure& cli, const char* host, uint16_t port,
         }
     }
 
+    // Соединение состоялось, а перехода на веб-сокет нет: узел ответил не тем. Раньше
+    // это молчаливо считалось «узел не работает» — теперь видно, что именно не сошлось.
+    ets_printf("[vual] %s: не подтвердил перевод (код %s, подпись %s)\n",
+               host, okStatus ? "да" : "нет", okAccept ? "да" : "нет");
     close(c);
     return false;
 }

@@ -7,6 +7,8 @@
 #include <esp_random.h>
 
 #include "relays.h"
+#include "psram.h"
+#include "store_sd.h"
 #include "ws.h"
 
 namespace tracker {
@@ -32,7 +34,10 @@ constexpr size_t kMaxRooms = 4;
 char g_rooms[kMaxRooms][41] = {};
 size_t g_roomCount = 0;
 
-char g_buf[2048];
+/** Приёмный буфер — во ВНЕШНЕЙ памяти: живёт всё время работы, а внутренняя нужна
+ *  защищённым соединениям. */
+char* g_buf = nullptr;
+constexpr size_t kBufSize = 4096;
 
 /** Объявляемся не чаще раза в полминуты: трекеры за назойливость отключают. */
 constexpr uint32_t kAnnounceMs = 30000;
@@ -211,11 +216,11 @@ void pumpNode(size_t slot) {
     }
 
     bool bin = false;
-    size_t n = ws::receive(nd.sock, reinterpret_cast<uint8_t*>(g_buf), sizeof(g_buf) - 1, &bin);
+    size_t n = ws::receive(nd.sock, reinterpret_cast<uint8_t*>(g_buf), kBufSize - 1, &bin);
     while (n > 0) {
         g_buf[n] = 0;
         handleMessage(g_buf);
-        n = ws::receive(nd.sock, reinterpret_cast<uint8_t*>(g_buf), sizeof(g_buf) - 1, &bin);
+        n = ws::receive(nd.sock, reinterpret_cast<uint8_t*>(g_buf), kBufSize - 1, &bin);
     }
 }
 
@@ -232,6 +237,8 @@ void trackerTask(void*) {
 }  // namespace
 
 bool begin(const uint8_t myPeerId[20]) {
+    if (!g_buf) g_buf = static_cast<char*>(psram::alloc(kBufSize));
+    if (!g_buf) { store::log("tracker", "нет памяти под буфер"); return false; }
     memcpy(g_peerId, myPeerId, sizeof(g_peerId));
     for (size_t i = 0; i < kMaxOpen; ++i) {
         g_node[i].which = i;

@@ -9,7 +9,10 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -21,6 +24,8 @@
 #include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
 #include <esp_random.h>
+#include <esp_netif.h>
+#include <lwip/ip6_addr.h>
 
 namespace phone {
 
@@ -189,11 +194,35 @@ uint64_t g_outSeq = 0;
 uint32_t g_inMsg = 0;
 uint32_t g_dataSeq = 0;                // номер кадра данных линка
 
-WiFiUDP  g_sock;                       // сокет сессии — отдельный от DHT
+/**
+ * Сокет сессии — СИСТЕМНЫЙ, двухсемейный, а не Arduino-обёртка.
+ *
+ * Обёртка WiFiUDP умеет только IPv4. С ней объявленный в визитке адрес IPv6 был
+ * декорацией: телефон, предпочитающий IPv6, стучался в него — а там никто не слушал.
+ * Один сокет семейства IPv6 с выключенным ограничением «только v6» принимает оба
+ * семейства сразу; адреса IPv4 внутри него живут в отображённом виде ::ffff:а.б.в.г.
+ */
+int      g_fd = -1;
 uint16_t g_sockPort = 0;
-uint32_t g_peerIp = 0;
-uint16_t g_peerPort = 0;
+sockaddr_in6 g_peerSa = {};
+bool     g_havePeer = false;
 bool     g_pathUp = false;
+
+/** Адрес IPv4 (сетевой порядок) и порт — в отображённый адрес двухсемейного сокета. */
+void v4mapped(uint32_t ipNet, uint16_t port, sockaddr_in6& sa) {
+    memset(&sa, 0, sizeof(sa));
+    sa.sin6_family = AF_INET6;
+    sa.sin6_port = htons(port);
+    sa.sin6_addr.un.u32_addr[2] = htonl(0xFFFF);
+    sa.sin6_addr.un.u32_addr[3] = ipNet;
+}
+
+/** Отправить датаграмму по заранее собранному адресу. */
+bool sockSend(const sockaddr_in6& to, const uint8_t* data, size_t len) {
+    if (g_fd < 0) return false;
+    return sendto(g_fd, data, len, 0,
+                  reinterpret_cast<const sockaddr*>(&to), sizeof(to)) == int(len);
+}
 
 uint32_t g_lastOffer = 0, g_lastPoll = 0, g_lastPing = 0;
 void (*g_onText)(const char*, const char*) = nullptr;
@@ -369,11 +398,16 @@ bool verifyTranscript(const char* t, size_t tlen, const uint8_t x[32], const uin
  * Кандидаты идут ОТСОРТИРОВАННЫМИ; у нас он один, поэтому сортировать нечего.
  */
 size_t cardTranscript(char* out, size_t cap, const char* x, const char* y,
-                      const char* ephB64, const char* nonceB64, const char* ep) {
-    const int n = snprintf(out, cap, "%s|%s|%s|%s|%s|%s%s",
-                           kVersion, x, y, ephB64, nonceB64,
-                           ep && ep[0] ? ep : "", ep && ep[0] ? "," : "");
-    return n > 0 ? size_t(n) : 0;
+                      const char* ephB64, const char* nonceB64,
+                      const char eps[][48], size_t epCount) {
+    int n = snprintf(out, cap, "%s|%s|%s|%s|%s|", kVersion, x, y, ephB64, nonceB64);
+    if (n <= 0) return 0;
+    for (size_t i = 0; i < epCount; ++i) {
+        const int k = snprintf(out + n, cap - size_t(n), "%s,", eps[i]);
+        if (k <= 0) return 0;
+        n += k;
+    }
+    return size_t(n);
 }
 
 /** Собрать свою визитку. Возвращает false, если нет личности или не хватило места. */
@@ -414,13 +448,39 @@ bool buildCard() {
     b64u(spki, sizeof(spki), ephB64, sizeof(ephB64));
     b64u(g_nonce, sizeof(g_nonce), nonceB64, sizeof(nonceB64));
 
-    // Кандидат — наш адрес в локальной сети и порт сессии: по нему телефон нас и найдёт.
-    char ep[32];
+    // Кандидаты: по ним телефон к нам и постучится.
+    //
+    // IPv6 добавляем ПЕРВЫМ делом, если он есть: телефонная версия ходит по IPv6
+    // предпочтительно (в её коде это прямо заявлено), и без такого кандидата встреча
+    // в сетях, где IPv4 за общим адресом, просто не состоится.
+    char eps[2][48];
+    size_t epCount = 0;
+
+    // Сперва глобальный адрес, при его отсутствии — локальный для звена: в домашней
+    // сети собеседник всё равно за тем же маршрутизатором, и локального хватает.
+    esp_ip6_addr_t ip6;
+    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    bool have6 = sta && esp_netif_get_ip6_global(sta, &ip6) == ESP_OK;
+    if (!have6 && sta) have6 = esp_netif_get_ip6_linklocal(sta, &ip6) == ESP_OK;
+    if (have6) {
+        char a[46];
+        ip6addr_ntoa_r(reinterpret_cast<const ip6_addr_t*>(&ip6), a, sizeof(a));
+        snprintf(eps[epCount++], sizeof(eps[0]), "[%s]:%u", a, unsigned(g_sockPort));
+    }
+
     const IPAddress ip = WiFi.localIP();
-    snprintf(ep, sizeof(ep), "%u.%u.%u.%u:%u", ip[0], ip[1], ip[2], ip[3], unsigned(g_sockPort));
+    snprintf(eps[epCount++], sizeof(eps[0]), "%u.%u.%u.%u:%u",
+             ip[0], ip[1], ip[2], ip[3], unsigned(g_sockPort));
+
+    // Подпись накрывает кандидатов ОТСОРТИРОВАННЫМИ — как у телефона (eps.sorted()).
+    if (epCount == 2 && strcmp(eps[0], eps[1]) > 0) {
+        char tmp[48];
+        strcpy(tmp, eps[0]); strcpy(eps[0], eps[1]); strcpy(eps[1], tmp);
+    }
 
     char t[768];
-    const size_t tlen = cardTranscript(t, sizeof(t), g_myX, g_myY, ephB64, nonceB64, ep);
+    const size_t tlen = cardTranscript(t, sizeof(t), g_myX, g_myY, ephB64, nonceB64,
+                                       eps, epCount);
     if (!tlen) { store::log("phone", "визитка: транскрипт не собрался"); return false; }
 
     uint8_t sig[80];
@@ -429,15 +489,20 @@ bool buildCard() {
     char sigB64[128];
     b64u(sig, siglen, sigB64, sizeof(sigB64));
 
+    char epsJson[110];
+    if (epCount == 2) snprintf(epsJson, sizeof(epsJson), "\"%s\",\"%s\"", eps[0], eps[1]);
+    else              snprintf(epsJson, sizeof(epsJson), "\"%s\"", eps[0]);
+
     const int n = snprintf(g_myCard, sizeof(g_myCard),
         "{\"v\":\"%s\",\"x\":\"%s\",\"y\":\"%s\",\"eph\":\"%s\",\"n\":\"%s\","
-        "\"eps\":[\"%s\"],\"sig\":\"%s\"}",
-        kVersion, g_myX, g_myY, ephB64, nonceB64, ep, sigB64);
+        "\"eps\":[%s],\"sig\":\"%s\"}",
+        kVersion, g_myX, g_myY, ephB64, nonceB64, epsJson, sigB64);
     if (n <= 0 || size_t(n) >= sizeof(g_myCard)) {
         store::log("phone", "визитка: не поместилась");
         return false;
     }
-    ets_printf("[vual] визитка готова, %d байт, адрес %s\n", n, ep);
+    ets_printf("[vual] визитка готова, %d байт, кандидатов %u: %s\n",
+               n, unsigned(epCount), eps[0]);
     return true;
 }
 
@@ -451,7 +516,7 @@ bool buildCard() {
  * уходили бы в пустоту, и найти это было бы крайне тяжело.
  */
 bool deriveKeys(const char* peerX, const char* peerY, const uint8_t* peerEphSpki,
-                size_t peerEphLen, const char* peerNonceB64) {
+                size_t peerEphLen, const char* peerNonceB64, bool iAmInitiator) {
     if (peerEphLen != 26 + 65 || peerEphSpki[26] != 0x04) return false;
 
     // Из X.509 обратно в сжатую точку — её ждёт наш ECDH.
@@ -465,11 +530,19 @@ bool deriveKeys(const char* peerX, const char* peerY, const uint8_t* peerEphSpki
     char myNonceB64[32];
     b64u(g_nonce, sizeof(g_nonce), myNonceB64, sizeof(myNonceB64));
 
-    // Инициатор идёт первым: a — мы, b — телефон.
+    // Порядок в транскрипте задаёт РОЛЬ: первым идёт тот, кто прислал предложение.
+    // Перепутать роли — значит развести гаммы: кадры уходят, но не читаются ни одной
+    // стороной, и выглядит это как полная тишина.
+    const char* aX = iAmInitiator ? g_myX : peerX;
+    const char* aY = iAmInitiator ? g_myY : peerY;
+    const char* bX = iAmInitiator ? peerX : g_myX;
+    const char* bY = iAmInitiator ? peerY : g_myY;
+    const char* aN = iAmInitiator ? myNonceB64 : peerNonceB64;
+    const char* bN = iAmInitiator ? peerNonceB64 : myNonceB64;
+
     char tr[512];
     const int trn = snprintf(tr, sizeof(tr), "%s|%s%s|%s%s|%s|%s",
-                             kVersion, g_myX, g_myY, peerX, peerY,
-                             myNonceB64, peerNonceB64);
+                             kVersion, aX, aY, bX, bY, aN, bN);
     if (trn <= 0) return false;
 
     uint8_t i2r[44], r2i[44];
@@ -478,8 +551,11 @@ bool deriveKeys(const char* peerX, const char* peerY, const uint8_t* peerEphSpki
     voile::hkdf(shared, sizeof(shared), reinterpret_cast<const uint8_t*>(tr), size_t(trn),
                 reinterpret_cast<const uint8_t*>("voile r2i"), 9, r2i, sizeof(r2i));
 
-    memcpy(g_sendKey, i2r, 32);       memcpy(g_sendNonce, i2r + 32, 12);
-    memcpy(g_recvKey, r2i, 32);       memcpy(g_recvNonce, r2i + 32, 12);
+    // Инициатор пишет ключом i2r и читает r2i, отвечающий — наоборот.
+    const uint8_t* mineKm   = iAmInitiator ? i2r : r2i;
+    const uint8_t* theirsKm = iAmInitiator ? r2i : i2r;
+    memcpy(g_sendKey, mineKm, 32);       memcpy(g_sendNonce, mineKm + 32, 12);
+    memcpy(g_recvKey, theirsKm, 32);     memcpy(g_recvNonce, theirsKm + 32, 12);
 
     // Ключ обфускации — из того же секрета, соль нулевая (VoileCrypto.cloakSeed).
     static const uint8_t zero[32] = {};
@@ -498,7 +574,7 @@ void nonceFor(const uint8_t base[12], uint64_t seq, uint8_t out[12]) {
 
 /** Отправить кадр линка: [тип][номер 8][шифртекст+тег], сверху обфускация. */
 bool linkSend(uint8_t type, const uint8_t* body, size_t len) {
-    if (!g_peerIp) return false;
+    if (!g_havePeer) return false;
 
     const uint64_t seq = g_outSeq++;
     uint8_t aad[9];
@@ -527,9 +603,7 @@ bool linkSend(uint8_t type, const uint8_t* body, size_t len) {
     const size_t sn = cloak::seal(g_cloakKey, pkt, 9 + len + 16, sealed, sizeof(sealed));
     if (!sn) return false;
 
-    g_sock.beginPacket(IPAddress(g_peerIp), g_peerPort);
-    g_sock.write(sealed, sn);
-    return g_sock.endPacket() == 1;
+    return sockSend(g_peerSa, sealed, sn);
 }
 
 /** Разобрать принятый кадр линка. Возвращает тип или 0. */
@@ -589,9 +663,9 @@ bool dhtSend(const net::Neighbour* nb, uint8_t type, const uint8_t* body, size_t
     const size_t sn = cloak::seal(key, pkt, 7 + kIdLen + len, sealed, sizeof(sealed));
     if (!sn) return false;
 
-    g_sock.beginPacket(IPAddress(nb->ip), nb->port);
-    g_sock.write(sealed, sn);
-    return g_sock.endPacket() == 1;
+    sockaddr_in6 to;
+    v4mapped(nb->ip, nb->port, to);
+    return sockSend(to, sealed, sn);
 }
 
 /** Положить своё предложение в комнату (DHT STORE), как это делает DhtRail.publish. */
@@ -625,6 +699,35 @@ void publishOffer() {
     if (sent) store::log("phone", "предложение положено в комнату");
 }
 
+/**
+ * Ответить на чужое предложение: тот же рельсовый кадр, но тип «a» и идентификатор
+ * ЧУЖОГО оффера — по нему отвечающая сторона узнаёт свой (Wire.RailWire("a", …)).
+ */
+void publishAnswer(const char* theirOid) {
+    if (!g_haveRoom || !g_myCard[0]) return;
+
+    char pidB64[40];
+    b64(g_pid, sizeof(g_pid), pidB64, sizeof(pidB64));
+
+    static char wire[kMaxCard + 256];
+    char ihHex[41];
+    for (size_t i = 0; i < kIdLen; ++i) snprintf(ihHex + i * 2, 3, "%02x", g_roomD[i]);
+    const int wn = snprintf(wire, sizeof(wire),
+        "0|{\"v\":1,\"t\":\"a\",\"ih\":\"%s\",\"pid\":\"%s\",\"oid\":\"%s\",\"sdp\":%s}",
+        ihHex, pidB64, theirOid, g_myCard);
+    if (wn <= 0) return;
+
+    static uint8_t body[kMaxCard + 300];
+    memcpy(body, g_roomD, kIdLen);
+    if (kIdLen + size_t(wn) > sizeof(body)) return;
+    memcpy(body + kIdLen, wire, size_t(wn));
+
+    size_t sent = 0;
+    for (size_t i = 0; i < net::neighbourCount(); ++i)
+        if (dhtSend(net::neighbourAt(i), D_STORE, body, kIdLen + size_t(wn))) ++sent;
+    if (sent) store::log("phone", "ответ положен в комнату");
+}
+
 /** Спросить комнату (DHT FIND_VALUE). */
 void pollRoom() {
     if (!g_haveRoom) return;
@@ -634,7 +737,13 @@ void pollRoom() {
 }
 
 /** Разобрать визитку телефона и поднять линк. */
-bool acceptAnswer(const char* cardJson) {
+/**
+ * Принять визитку собеседника и поднять канал.
+ *
+ * iAmInitiator: true — это ОТВЕТ на наше предложение; false — это ЧУЖОЕ предложение,
+ * на которое отвечаем мы. Роль решает порядок в транскрипте и раскладку ключей.
+ */
+bool acceptCard(const char* cardJson, bool iAmInitiator) {
     char x[64], y[64], ephB64[200], nonceB64[40], sigB64[160], ep[48];
     if (!jsonStr(cardJson, "x", x, sizeof(x))) return false;
     if (!jsonStr(cardJson, "y", y, sizeof(y))) return false;
@@ -673,26 +782,55 @@ bool acceptAnswer(const char* cardJson) {
         store::log("phone", "подпись визитки неверна");
         return false;
     }
-    if (!deriveKeys(x, y, eph, ephLen, nonceB64)) return false;
+    if (!deriveKeys(x, y, eph, ephLen, nonceB64, iAmInitiator)) return false;
 
     // Куда стучаться: первый кандидат из визитки.
     if (!epCount) return false;
-    strncpy(ep, eps[0], sizeof(ep) - 1);
-    ep[sizeof(ep) - 1] = 0;
-    char* colon = strrchr(ep, ':');
-    if (!colon) return false;
-    *colon = 0;
-    IPAddress ip;
-    if (!ip.fromString(ep)) return false;
-    g_peerIp = uint32_t(ip);
-    g_peerPort = uint16_t(atoi(colon + 1));
+    // Ищем первый кандидат, который мы умеем набрать. IPv6 телефон предлагает первым,
+    // но плата ходит по нему не всегда — тогда берём следующий, а не сдаёмся.
+    bool dialled = false;
+    for (size_t i = 0; i < epCount && !dialled; ++i) {
+        strncpy(ep, eps[i], sizeof(ep) - 1);
+        ep[sizeof(ep) - 1] = 0;
+        char* colon = strrchr(ep, ':');
+        if (!colon) continue;
+        *colon = 0;
+        const uint16_t port = uint16_t(atoi(colon + 1));
+
+        if (ep[0] == '[') {
+            // Адрес IPv6 в скобках — собираем sockaddr семейства v6 напрямую.
+            char* addr = ep + 1;
+            char* close = strchr(addr, ']');
+            if (!close) continue;
+            *close = 0;
+            ip6_addr_t v6;
+            if (!ip6addr_aton(addr, &v6)) continue;
+            memset(&g_peerSa, 0, sizeof(g_peerSa));
+            g_peerSa.sin6_family = AF_INET6;
+            g_peerSa.sin6_port = htons(port);
+            memcpy(&g_peerSa.sin6_addr, &v6, sizeof(v6));
+            dialled = true;
+        } else {
+            // Адрес IPv4 — в отображённый вид, чтобы уйти тем же двухсемейным сокетом.
+            IPAddress ip;
+            if (!ip.fromString(ep)) continue;
+            v4mapped(uint32_t(ip), port, g_peerSa);
+            dialled = true;
+        }
+    }
+    if (!dialled) {
+        store::log("phone", "ни один адрес собеседника не разобран");
+        return false;
+    }
+    g_havePeer = true;
 
     snprintf(g_peer, sizeof(g_peer), "%.*s", 16, x);   // короткий отпечаток для журнала
     g_linked = true;
     g_pathUp = false;
     g_outSeq = 0;
     g_dataSeq = 0;
-    store::log("phone", "визитка принята, поднимаю канал");
+    store::log("phone", iAmInitiator ? "ответ принят, поднимаю канал"
+                                     : "предложение принято, отвечаю");
     linkSend(L_PING, nullptr, 0);
     return true;
 }
@@ -739,31 +877,59 @@ void onRoomValue(const char* v, size_t len) {
         return;
     }
 
-    // Нас интересует ответ на НАШЕ предложение: тип «a» и наш же идентификатор оффера.
-    char t[4], oid[40];
+    if (g_linked) return;                         // канал уже есть — чужое не трогаем
+
+    char t[4], oid[40], pid[40];
     if (!jsonStr(whole, "t", t, sizeof(t))) return;
-    if (t[0] != 'a') return;
     if (!jsonStr(whole, "oid", oid, sizeof(oid))) return;
-    char myOid[40];
-    b64(g_oid, sizeof(g_oid), myOid, sizeof(myOid));
-    if (strcmp(oid, myOid) != 0) return;
+
+    // Своё же сообщение прилетает обратно тем же опросом комнаты — узнаём по подписи
+    // и молча пропускаем, иначе плата попыталась бы знакомиться сама с собой.
+    char myPid[40];
+    b64(g_pid, sizeof(g_pid), myPid, sizeof(myPid));
+    if (jsonStr(whole, "pid", pid, sizeof(pid)) && strcmp(pid, myPid) == 0) return;
 
     const char* sdp = strstr(whole, "\"sdp\":");
     if (!sdp) return;
     sdp += 6;
     if (*sdp != '{') return;                      // визитка — вложенный объект
-    if (!g_linked) acceptAnswer(sdp);
+
+    if (t[0] == 'a') {
+        // Ответ на НАШЕ предложение: сверяем, что отвечают именно нам.
+        char myOid[40];
+        b64(g_oid, sizeof(g_oid), myOid, sizeof(myOid));
+        if (strcmp(oid, myOid) != 0) return;
+        acceptCard(sdp, /*iAmInitiator=*/true);
+        return;
+    }
+
+    if (t[0] == 'o') {
+        // ЧУЖОЕ предложение — отвечаем на него, как это делает телефон. Раньше плата
+        // только клала своё и ждала: если телефон в это время делал ровно то же самое,
+        // обе стороны ждали друг друга и встреча не складывалась никогда.
+        //
+        // На один и тот же оффер отвечаем один раз: копии приезжают по каждой рельсе.
+        if (strcmp(oid, g_answeredOid) == 0) return;
+        snprintf(g_answeredOid, sizeof(g_answeredOid), "%s", oid);
+
+        if (!acceptCard(sdp, /*iAmInitiator=*/false)) {
+            g_answeredOid[0] = 0;      // не сложилось — следующая копия попробует снова
+            return;
+        }
+        publishAnswer(oid);
+    }
 }
 
-/** Приём на сокете сессии: ответы DHT и кадры линка. */
+/** Приём на сокете сессии: ответы DHT и кадры линка. Сокет неблокирующий. */
 void readSocket() {
-    int size = g_sock.parsePacket();
-    while (size > 0) {
+    if (g_fd < 0) return;
+    for (;;) {
         static uint8_t buf[1600];
-        const int n = g_sock.read(buf, sizeof(buf));
-        if (n <= 0) { size = g_sock.parsePacket(); continue; }
-        const uint32_t fromIp = uint32_t(g_sock.remoteIP());
-        const uint16_t fromPort = uint16_t(g_sock.remotePort());
+        sockaddr_in6 from = {};
+        socklen_t fromLen = sizeof(from);
+        const int n = recvfrom(g_fd, buf, sizeof(buf), 0,
+                               reinterpret_cast<sockaddr*>(&from), &fromLen);
+        if (n <= 0) return;                       // пусто — до следующего круга
 
         // Сперва линк: если он поднят, большая часть пакетов именно его.
         if (g_linked) {
@@ -772,8 +938,10 @@ void readSocket() {
             const uint8_t type = linkRecv(buf, size_t(n), body, sizeof(body), bodyLen);
             if (type) {
                 if (!g_pathUp) {
+                    // Отвечаем туда, ОТКУДА реально пришло: телефон может выйти не с
+                    // того адреса, что объявлял, — путь важнее визитки.
                     g_pathUp = true;
-                    g_peerIp = fromIp; g_peerPort = fromPort;
+                    g_peerSa = from;
                     store::log("phone", "канал с телефоном установлен");
                 }
                 if (type == L_PING) {
@@ -796,7 +964,6 @@ void readSocket() {
                     }
                     ++g_inMsg;
                 }
-                size = g_sock.parsePacket();
                 continue;
             }
         }
@@ -817,7 +984,6 @@ void readSocket() {
                 left -= 2 + vlen;
             }
         }
-        size = g_sock.parsePacket();
     }
 }
 
@@ -838,7 +1004,23 @@ bool begin() {
 
     // Свой порт: сессия телефона живёт отдельно от DHT — так же, как у него самого.
     g_sockPort = uint16_t(41000 + (esp_random() % 15000));
-    if (!g_sock.begin(g_sockPort)) return false;
+
+    // Один сокет семейства IPv6 с выключенным «только v6» слушает ОБА семейства.
+    // Обёртка WiFiUDP этого не умеет — с ней объявленный адрес IPv6 был бы приманкой,
+    // в которую телефон стучится впустую.
+    g_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (g_fd < 0) { store::log("phone", "сокет не открылся"); return false; }
+    int off = 0;
+    setsockopt(g_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+    sockaddr_in6 bindSa = {};
+    bindSa.sin6_family = AF_INET6;
+    bindSa.sin6_port = htons(g_sockPort);
+    if (bind(g_fd, reinterpret_cast<sockaddr*>(&bindSa), sizeof(bindSa)) != 0) {
+        store::log("phone", "порт сессии занят");
+        ::close(g_fd); g_fd = -1;
+        return false;
+    }
+    fcntl(g_fd, F_SETFL, O_NONBLOCK);
 
     if (!buildCard()) { store::log("phone", "визитку собрать не удалось"); return false; }
     g_ready = true;
@@ -856,6 +1038,13 @@ void setPhrase(const char* phrase) {
     sha1of(reinterpret_cast<const uint8_t*>(in), size_t(n), g_roomD);
     g_haveRoom = true;
     g_lastOffer = 0;                 // объявиться сразу, не дожидаясь круга
+    g_answeredOid[0] = 0;
+
+    // Визитку пересобираем НА КАЖДОЕ знакомство, а не один раз при старте. Причины две.
+    // Адрес IPv6 приходит через несколько секунд после подключения к сети — визитка,
+    // собранная при старте, его не застала и навсегда объявляла один IPv4. И эфемерный
+    // ключ обязан быть свежим на каждую встречу: в этом весь его смысл.
+    if (g_ready && !buildCard()) store::log("phone", "визитка не пересобралась");
 }
 
 bool linked() { return g_linked && g_pathUp; }

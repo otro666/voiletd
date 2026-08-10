@@ -15,6 +15,7 @@
 // Значки нарисованы тонким штрихом со скруглёнными концами — как в телефонных
 // мессенджерах, а не «из палочек», как вышло в первой версии.
 #include "ui.h"
+#include "psram.h"
 #include "rail.h"
 #include "nostr.h"
 #include "tracker.h"
@@ -1349,6 +1350,13 @@ void drawStatus2(const Status& st, const char* ip, bool radioOk, bool sdOk) {
     // а не прошлогодний файл, приблудившийся на хостинге рядом со страницей заливки.
     snprintf(buf, sizeof(buf), "%s %s", __DATE__, __TIME__);
     line("Сборка", buf, kTextTertiary);
+
+    // Память — рядом с рельсами не случайно: когда узлы показывают нули, первым делом
+    // смотрят сюда. Внешняя должна быть в мегабайтах, внутренняя — в сотнях килобайт.
+    snprintf(buf, sizeof(buf), "внеш. %lu КБ · внутр. %lu КБ",
+             (unsigned long)(psram::freeExternal() / 1024),
+             (unsigned long)(psram::freeInternal() / 1024));
+    line("Память", buf, psram::freeInternal() < 60000 ? kWarning : kTextSecond);
 }
 
 // ── касания ────────────────────────────────────────────────────────────────────────────

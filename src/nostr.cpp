@@ -9,6 +9,8 @@
 #include <time.h>
 
 #include "relays.h"
+#include "store_sd.h"
+#include "psram.h"
 #include "schnorr.h"
 #include "ws.h"
 
@@ -40,7 +42,10 @@ constexpr size_t kMaxRooms = 4;
 char g_rooms[kMaxRooms][41] = {};
 size_t g_roomCount = 0;
 
-char g_buf[2048];
+/** Приёмный буфер — во ВНЕШНЕЙ памяти: он держится всё время работы и занимает место,
+ *  которого во внутренней не хватало защищённым соединениям. */
+char* g_buf = nullptr;
+constexpr size_t kBufSize = 4096;
 
 void toHex(const uint8_t* in, size_t len, char* out) {
     static const char* d = "0123456789abcdef";
@@ -217,12 +222,11 @@ void pumpNode(size_t slot) {
     ws::keepAlive(nd.sock);
 
     bool bin = false;
-    size_t n = ws::receive(nd.sock, reinterpret_cast<uint8_t*>(g_buf),
-                           sizeof(g_buf) - 1, &bin);
+    size_t n = ws::receive(nd.sock, reinterpret_cast<uint8_t*>(g_buf), kBufSize - 1, &bin);
     while (n > 0) {
         g_buf[n] = 0;
         if (strncmp(g_buf, "[\"EVENT\"", 8) == 0) handleEvent(g_buf);
-        n = ws::receive(nd.sock, reinterpret_cast<uint8_t*>(g_buf), sizeof(g_buf) - 1, &bin);
+        n = ws::receive(nd.sock, reinterpret_cast<uint8_t*>(g_buf), kBufSize - 1, &bin);
     }
 }
 
@@ -257,12 +261,19 @@ void b64(const uint8_t* in, size_t len, char* out, size_t cap) {
 }  // namespace
 
 bool begin(const uint8_t myPeerId[20]) {
+    if (!g_buf) g_buf = static_cast<char*>(psram::alloc(kBufSize));
+    if (!g_buf) { store::log("nostr", "нет памяти под буфер"); return false; }
     memcpy(g_peerId, myPeerId, sizeof(g_peerId));
 
     // Ключ подписи создаём заново при каждом запуске. Постоянный связывал бы все наши
     // появления в одну цепочку, а знакомство — дело разовое, помнить нас узлам незачем.
     esp_fill_random(g_sk, sizeof(g_sk));
-    if (!schnorr::publicKey(g_sk, g_pk)) return false;
+    if (!schnorr::publicKey(g_sk, g_pk)) {
+        // Без ключа подписи рельса не запускается ВООБЩЕ: поток не создаётся, и на
+        // экране состояния вечный ноль без единого слова о причине.
+        store::log("nostr", "не вышел ключ подписи — рельса не запущена");
+        return false;
+    }
     toHex(g_pk, sizeof(g_pk), g_pkHex);
 
     for (size_t i = 0; i < kMaxOpen; ++i) {

@@ -23,7 +23,10 @@ constexpr const char* kMedia    = "/vual/media";
 
 /** Журнал не должен съесть карту. При превышении начинаем заново: старое к тому времени
  *  уже неинтересно, а разбирать гигабайт всё равно никто не станет. */
-constexpr uint32_t kLogMax = 2UL * 1024 * 1024;
+// Журнал — инструмент разбора, а не архив. Двухмегабайтный файл давал заметную задержку
+// при открытии экрана даже после ускорения чтения, а пользы от такой глубины нет:
+// смотрят всегда последние сотни строк. Четверть мегабайта — это тысячи строк.
+constexpr uint32_t kLogMax = 256UL * 1024;
 
 /** Имя собеседника в имени файла: чистим от того, что файловая система не примет. */
 void safeName(const char* in, char* out, size_t cap) {
@@ -240,6 +243,34 @@ const char* mediaPath(const char* peer, const char* fileName) {
 void log(const char* tag, const char* text) {
     if (!g_ready) return;
 
+    // Подряд идущие одинаковые строки не пишем, а считаем.
+    //
+    // Повторяющаяся раз в несколько секунд неудача (например, «визитку собрать не
+    // удалось») за час превращает журнал в десятки тысяч одинаковых строк: и файл
+    // распухает, и найти в нём что-то другое невозможно. Одна строка со счётчиком
+    // несёт ровно ту же весть.
+    static char lastTag[16] = {};
+    static char lastText[96] = {};
+    static uint32_t repeats = 0;
+    const bool same = tag && text && strncmp(lastTag, tag, sizeof(lastTag) - 1) == 0 &&
+                      strncmp(lastText, text, sizeof(lastText) - 1) == 0;
+    if (same) {
+        ++repeats;
+        // Пишем не каждый повтор, а по круглым числам — чтобы след остался, а файл нет.
+        if (repeats != 10 && repeats != 100 && repeats % 1000 != 0) return;
+    } else {
+        repeats = 0;
+        snprintf(lastTag, sizeof(lastTag), "%s", tag ? tag : "");
+        snprintf(lastText, sizeof(lastText), "%s", text ? text : "");
+    }
+
+    char withCount[160];
+    if (repeats) {
+        snprintf(withCount, sizeof(withCount), "%s (повторов: %lu)",
+                 text ? text : "", (unsigned long)repeats);
+        text = withCount;
+    }
+
     if (g_logSize > kLogMax) {
         SD.remove(kLog);
         g_logSize = 0;
@@ -274,18 +305,41 @@ size_t logPage(size_t page, size_t perPage, char* buf, size_t bufCap,
     File f = SD.open(kLog, FILE_READ);
     if (!f) return 0;
 
-    // Сколько строк всего. Считаем проходом по файлу: держать в памяти нечего, а
-    // посчитать переводы строк дёшево даже на мегабайте.
+    // Считаем строки БЛОКАМИ, а не по байту.
+    //
+    // Раньше здесь стояло чтение по одному байту за раз, и на каждый байт приходилось
+    // обращение к карте. Пока журнал был крошечным, это сходило с рук; на разросшемся
+    // файле экран «Журнал» стал открываться по несколько секунд, а то и дольше. Блок в
+    // полкилобайта уменьшает число обращений в пятьсот раз при том же результате.
+    static uint8_t blk[512];
     size_t total = 0;
-    while (f.available()) { if (f.read() == '\n') ++total; }
+    int got = 0;
+    while ((got = f.read(blk, sizeof(blk))) > 0)
+        for (int i = 0; i < got; ++i) if (blk[i] == '\n') ++total;
 
     // Страница 0 — конец файла. Отступаем от него на нужное число строк.
     const size_t skipFromStart = (total > (page + 1) * perPage)
                                ? total - (page + 1) * perPage : 0;
     if (hasMore) *hasMore = skipFromStart > 0;
 
-    f.seek(0);
-    for (size_t i = 0; i < skipFromStart && f.available(); ++i) f.readStringUntil('\n');
+    // Пропуск — тем же блочным проходом: ищем смещение нужной строки и прыгаем на него,
+    // вместо того чтобы вычитывать строку за строкой.
+    uint32_t offset = 0;
+    if (skipFromStart) {
+        f.seek(0);
+        size_t seen = 0;
+        uint32_t base = 0;
+        bool found = false;
+        while (!found && (got = f.read(blk, sizeof(blk))) > 0) {
+            for (int i = 0; i < got; ++i) {
+                if (blk[i] != '\n') continue;
+                if (++seen == skipFromStart) { offset = base + uint32_t(i) + 1; found = true; break; }
+            }
+            base += uint32_t(got);
+        }
+        if (!found) offset = base;
+    }
+    f.seek(offset);
 
     size_t used = 0, count = 0;
     while (f.available() && count < perPage && used + 2 < bufCap) {

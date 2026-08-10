@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "relays.h"
+#include "psram.h"
 
 namespace rail {
 
@@ -40,7 +41,9 @@ constexpr size_t kMaxRooms = 4;
 char g_rooms[kMaxRooms][41] = {};
 size_t g_roomCount = 0;
 
-uint8_t g_buf[1024];
+/** Рабочий буфер пакетов — во внешней памяти по той же причине, что у прочих рельс. */
+uint8_t* g_buf = nullptr;
+constexpr size_t kBufSize = 4096;
 
 // ── упаковка чисел переменной длины ────────────────────────────────────────────────────
 //
@@ -155,7 +158,7 @@ void sendPublish(Conn& c, const char* room, const char* payload) {
     const size_t plen = strlen(payload);
     const size_t tlen = strlen(topic) + 2;
     const size_t total = tlen + plen;
-    if (total > sizeof(g_buf)) return;
+    if (total > kBufSize) return;
 
     static uint8_t pkt[1024];
     size_t h = 0;
@@ -294,7 +297,7 @@ void pumpConn(size_t i) {
 
     // В каждом кадре — целый пакет брокера, разбираем сразу.
     bool bin = false;
-    size_t n = ws::receive(c.sock, g_buf, sizeof(g_buf), &bin);
+    size_t n = ws::receive(c.sock, g_buf, kBufSize, &bin);
     while (n > 0) {
         if (n >= 2) {
             const uint8_t type = g_buf[0];
@@ -304,7 +307,7 @@ void pumpConn(size_t i) {
                 handlePublish(g_buf + 1 + used, len);
             }
         }
-        n = ws::receive(c.sock, g_buf, sizeof(g_buf), &bin);
+        n = ws::receive(c.sock, g_buf, kBufSize, &bin);
     }
 }
 
@@ -340,6 +343,8 @@ TaskHandle_t g_task = nullptr;
 }  // namespace
 
 bool begin(const uint8_t myPeerId[20]) {
+    if (!g_buf) g_buf = static_cast<uint8_t*>(psram::alloc(kBufSize));
+    if (!g_buf) return false;
     memcpy(g_peerId, myPeerId, sizeof(g_peerId));
     for (auto& c : g_conn) { c.open = false; c.nextTry = 0; }
 

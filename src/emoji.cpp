@@ -1,5 +1,6 @@
 #include "emoji.h"
 #include "emoji_rom.h"
+#include "psmem.h"
 
 #include "display.h"
 #include "ui.h"
@@ -74,10 +75,15 @@ bool bake(size_t index) {
 
     File f = SD.open(path, FILE_READ);
     if (!f) return false;
+    constexpr size_t kRawCap = 24576;
     const size_t len = size_t(f.size());
-    if (len == 0 || len > 24576) { f.close(); return false; }
+    if (len == 0 || len > kRawCap) { f.close(); return false; }
 
-    static uint8_t raw[24576];
+    // Буфер файла — во внешней памяти: 24 КБ внутренней он занимал НАВСЕГДА, хотя
+    // нужен только в первые секунды после старта, пока разворачивается набор.
+    static uint8_t* raw = nullptr;
+    if (!raw) raw = static_cast<uint8_t*>(psmem::bigAlloc(kRawCap, "эмодзи-файл"));
+    if (!raw) { f.close(); return false; }
     const int got = f.read(raw, len);
     f.close();
     if (got != int(len)) return false;
@@ -94,6 +100,9 @@ bool bake(size_t index) {
     // прозрачность каждой точки.
     LGFX_Sprite black(&vualScreen()), white(&vualScreen());
     black.setColorDepth(16); white.setColorDepth(16);
+    // Развёртки — во внешнюю: две картинки 128×128 это 64 КБ разом, и именно такие
+    // пиковые запросы валили внутреннюю память в самый неподходящий момент.
+    black.setPsram(true); white.setPsram(true);
     // Каждый буфер ПРОВЕРЯЕТСЯ. Большая картинка — это десятки килобайт на каждую из
     // двух развёрток; не хватило памяти — честно пропускаем картинку, а не пишем в
     // пустоту: запись через несозданный буфер и есть перезагрузка с воплем StoreProhibited.
@@ -126,7 +135,9 @@ bool bake(size_t index) {
         return swapped ? __builtin_bswap16(v) : v;
     };
 
-    Baked* b = new (std::nothrow) Baked;
+    // Готовые картинки живут до перезагрузки — все 50 КБ набора им положено держать
+    // во внешней памяти, скорость PSRAM для отрисовки за глаза.
+    Baked* b = static_cast<Baked*>(psmem::bigAlloc(sizeof(Baked), "эмодзи-набор"));
     if (!b) { black.deleteSprite(); white.deleteSprite(); return false; }
 
     // Ужатие усреднением по площади: каждая точка итога — среднее всех точек исходника,

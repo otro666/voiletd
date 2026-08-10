@@ -1,4 +1,5 @@
 #include "net.h"
+#include "psram.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -33,9 +34,12 @@ size_t    g_neighbourCount = 0;
  *  идут раз в пять секунд, но в загруженной сети часть теряется. */
 constexpr uint32_t kFreshMs = 45000;
 
-uint8_t g_rx[1600];
-uint8_t g_plain[1600];
-uint8_t g_out[1600];
+// Три постоянных буфера обмена — во внешней памяти: вместе это почти пять килобайт,
+// которые во внутренней нужнее защищённым соединениям рельс.
+uint8_t* g_rx = nullptr;
+uint8_t* g_plain = nullptr;
+uint8_t* g_out = nullptr;
+constexpr size_t kNetBuf = 1600;
 
 /** Имя узла выводим из долговременного ключа: оно должно быть тем же и после
  *  перезапуска, иначе собеседники нас не узнают. */
@@ -80,7 +84,7 @@ void announce() {
     p[kIdLen] = uint8_t(g_port >> 8);
     p[kIdLen + 1] = uint8_t(g_port & 0xFF);
 
-    const size_t n = cloak::seal(cloak::discoveryKey(), p, sizeof(p), g_out, sizeof(g_out));
+    const size_t n = cloak::seal(cloak::discoveryKey(), p, sizeof(p), g_out, kNetBuf);
     if (n == 0) return;                 // часы не выставлены — объявляться бессмысленно
 
     // Группа — основной путь, широковещание — запасной: в части сетей групповую рассылку
@@ -99,7 +103,7 @@ void announce() {
 /** Разбор принятого пакета. */
 void handlePacket(const uint8_t* buf, size_t len, uint32_t fromIp, uint16_t fromPort) {
     // Сначала пробуем ключ рассылки: так приходят объявления и запросы знакомства.
-    size_t n = cloak::open(cloak::discoveryKey(), buf, len, g_plain, sizeof(g_plain));
+    size_t n = cloak::open(cloak::discoveryKey(), buf, len, g_plain, kNetBuf);
     if (n == kIdLen + 2) {
         const uint16_t port = uint16_t((g_plain[kIdLen] << 8) | g_plain[kIdLen + 1]);
         if (memcmp(g_plain, g_myId, kIdLen) != 0) {   // своё объявление пропускаем
@@ -111,7 +115,7 @@ void handlePacket(const uint8_t* buf, size_t len, uint32_t fromIp, uint16_t from
     // Затем — ключ, выведенный из НАШЕГО имени: так приходят сообщения лично нам.
     uint8_t key[32];
     cloak::keyForNode(g_myId, key);
-    n = cloak::open(key, buf, len, g_plain, sizeof(g_plain));
+    n = cloak::open(key, buf, len, g_plain, kNetBuf);
     if (n == 0) return;                 // чужое или мусор — молчим, не отвечаем
 
     // ── ответ на опрос DHT ────────────────────────────────────────────────────────────
@@ -142,7 +146,7 @@ void handlePacket(const uint8_t* buf, size_t len, uint32_t fromIp, uint16_t from
             // сможет наш ответ раскрыть.
             uint8_t rk[32];
             cloak::keyForNode(who, rk);
-            const size_t sealed = cloak::seal(rk, reply, o, g_out, sizeof(g_out));
+            const size_t sealed = cloak::seal(rk, reply, o, g_out, kNetBuf);
             if (sealed) {
                 g_lan.beginPacket(IPAddress(fromIp), fromPort);
                 g_lan.write(g_out, sealed);
@@ -179,6 +183,11 @@ bool begin() {
     if (!WiFi.isConnected()) return false;
     if (!contacts::haveIdentity()) return false;   // без личности имя узла не вывести
 
+    if (!g_rx)    g_rx    = static_cast<uint8_t*>(psram::alloc(kNetBuf));
+    if (!g_plain) g_plain = static_cast<uint8_t*>(psram::alloc(kNetBuf));
+    if (!g_out)   g_out   = static_cast<uint8_t*>(psram::alloc(kNetBuf));
+    if (!g_rx || !g_plain || !g_out) return false;
+
     computeMyId();
 
     // Порт выбираем случайный из верхнего диапазона: постоянный номер был бы приметой,
@@ -201,7 +210,7 @@ void pump() {
     // Приём
     int size = g_lan.parsePacket();
     while (size > 0) {
-        const int n = g_lan.read(g_rx, sizeof(g_rx));
+        const int n = g_lan.read(g_rx, kNetBuf);
         if (n > 0) {
             handlePacket(g_rx, size_t(n),
                          uint32_t(g_lan.remoteIP()), uint16_t(g_lan.remotePort()));
@@ -243,7 +252,7 @@ bool sendTo(const uint8_t id[kIdLen], const uint8_t* data, size_t len) {
     // пакет, не отличит его от шума и не поймёт, кому он адресован.
     uint8_t key[32];
     cloak::keyForNode(id, key);
-    const size_t sealed = cloak::seal(key, data, len, g_out, sizeof(g_out));
+    const size_t sealed = cloak::seal(key, data, len, g_out, kNetBuf);
     if (sealed == 0) return false;
 
     g_lan.beginPacket(IPAddress(n->ip), n->port);

@@ -21,6 +21,9 @@
 #include "audio.h"
 #include "net.h"
 #include "phone.h"
+#include "psram.h"
+
+#include <esp_netif.h>
 #include "rail.h"
 #include "nostr.h"
 #include "tracker.h"
@@ -1335,17 +1338,29 @@ static void connectWifi() {
 
     configTime(0, 0, "pool.ntp.org", "time.google.com");
     net::begin();
-    rail::begin(net::myId());
+
+    // IPv6 включаем ЯВНО. Плата по умолчанию живёт только в IPv4, и адрес IPv6 не
+    // появляется сам — а телефонная версия ходит по нему предпочтительно. Без этой
+    // строки визитка всегда объявляла один адрес IPv4, и встреча в сетях с общим
+    // внешним адресом не складывалась.
+    if (esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) {
+        if (esp_netif_create_ip6_linklocal(sta) == ESP_OK)
+            store::log("net", "IPv6 запрошен");
+        else
+            store::log("net", "IPv6 недоступен");
+    }
+
+    if (!rail::begin(net::myId())) store::log("rail", "рельса брокеров не запущена");
     rail::setOnMessage(onRailMessage);
 
     // Вторая рельса — запасной путь. Брокеры и узлы Nostr закрывают разными способами и
     // в разных местах: когда не работает одно, обычно работает другое.
-    nostr::begin(net::myId());
+    if (!nostr::begin(net::myId())) store::log("nostr", "рельса Nostr не запущена");
     nostr::setOnMessage(onNostrMessage);
 
     // Третья рельса — трекеры. Самая живучая: их закрывают реже всего, потому что они
     // нужны слишком многим и на вид безобидны.
-    tracker::begin(net::myId());
+    if (!tracker::begin(net::myId())) store::log("tracker", "рельса трекеров не запущена");
     tracker::setOnMessage(onTrackerMessage);
 
     // Внешний адрес спросим ПОТОМ, из общего цикла: опрос семи серверов — ещё восемь
@@ -1770,6 +1785,10 @@ void setup() {
     delay(1500);
     Serial.println();
     Serial.println("=== Вуаль: запуск ===");
+
+    // Внешнюю память включаем ПЕРВЫМ делом: смысл в том, чтобы буферы всего, что
+    // поднимется дальше — карты, сети, рельс, — уже уходили туда, а не во внутреннюю.
+    psram::begin();
     // Штамп — И в аппаратный порт тоже: обычный Serial здесь уходит в USB, а монитор
     // чаще висит на UART. Одна строка отвечает на вопрос «что за прошивка залита».
 #ifndef VUAL_BUILD_STAMP
@@ -1960,11 +1979,23 @@ void setup() {
             if (WiFi.isConnected()) {
                 configTime(0, 0, "pool.ntp.org", "time.google.com");
                 net::begin();
-                rail::begin(net::myId());
+
+                // Тот же набор действий, что при подключении на старте. Этот путь —
+                // подключение из настроек — в прошлый раз остался без IPv6 и без
+                // проверок запуска: исправление, живущее только в одной из двух
+                // одинаковых веток, — это исправление наполовину.
+                if (esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) {
+                    if (esp_netif_create_ip6_linklocal(sta) == ESP_OK)
+                        store::log("net", "IPv6 запрошен");
+                    else
+                        store::log("net", "IPv6 недоступен");
+                }
+                if (!rail::begin(net::myId())) store::log("rail", "рельса брокеров не запущена");
                 rail::setOnMessage(onRailMessage);
-                nostr::begin(net::myId());
+                if (!nostr::begin(net::myId())) store::log("nostr", "рельса Nostr не запущена");
                 nostr::setOnMessage(onNostrMessage);
-                tracker::begin(net::myId());
+                if (!tracker::begin(net::myId()))
+                    store::log("tracker", "рельса трекеров не запущена");
                 tracker::setOnMessage(onTrackerMessage);
                 needExternal_ = true;
                 store::log("wifi", "подключено");
