@@ -25,6 +25,8 @@
 
 #include <esp_netif.h>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "rail.h"
 #include "nostr.h"
 #include "tracker.h"

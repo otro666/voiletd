@@ -102,11 +102,7 @@ void configTime(long, int, const char*, const char* = nullptr, const char* = nul
 #include <time.h>
 #include "esp_err.h"
 #include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #define PROGMEM
-#define pdMS_TO_TICKS(x) (x)
-typedef void* TaskHandle_t;
-#define pdPASS 1
-#define pdFAIL 0
-void vTaskDelay(uint32_t);
-int xTaskCreatePinnedToCore(void (*)(void*), const char*, uint32_t, void*, int,
-                            TaskHandle_t*, int);
