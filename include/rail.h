@@ -75,6 +75,9 @@ void sendAnswer(const char* roomHex, const uint8_t offerId[20], const char* body
  */
 void sendRaw(const char* roomHex, const char* json);
 
+/** Один шаг обслуживания рельсы: вызывается общим потоком рельс из main. */
+void poll();
+
 void setOnMessage(OnMessage cb);
 
 /** Имена брокеров и их состояние — для экрана состояния. */

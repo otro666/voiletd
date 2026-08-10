@@ -39,7 +39,8 @@ namespace tracker {
  * а при неудаче каждая шагает дальше — так за несколько кругов перебирается ВЕСЬ
  * список узлов, а не первые три.
  */
-constexpr size_t kMaxOpen = 3;
+/** Одновременных трекеров — как у телефонной версии (пять живых). */
+constexpr size_t kMaxOpen = 5;
 
 struct Incoming {
     char    kind;          // 'p' присутствие, 'o' предложение, 'a' ответ
@@ -73,6 +74,9 @@ void sendAnswer(const char* roomHex, const uint8_t offerId[20], const char* body
  * рельса. Рельса здесь — только труба.
  */
 void sendRaw(const char* roomHex, const char* json);
+
+/** Один шаг обслуживания рельсы: вызывается общим потоком рельс из main. */
+void poll();
 
 void setOnMessage(OnMessage cb);
 

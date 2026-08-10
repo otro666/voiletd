@@ -29,7 +29,6 @@ struct Node {
 Node g_node[kMaxOpen];
 uint8_t g_peerId[20] = {};
 OnMessage g_onMessage = nullptr;
-TaskHandle_t g_task = nullptr;
 
 constexpr size_t kMaxRooms = 4;
 char g_rooms[kMaxRooms][41] = {};
@@ -231,14 +230,6 @@ void pumpNode(size_t slot) {
 }
 
 /** Свой поток на втором ядре — как у двух других рельс. */
-void trackerTask(void*) {
-    for (;;) {
-        if (WiFi.isConnected()) {
-            for (size_t i = 0; i < kMaxOpen; ++i) pumpNode(i);
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
 
 }  // namespace
 
@@ -250,22 +241,10 @@ bool begin(const uint8_t myPeerId[20]) {
         g_node[i].which = i;
         g_node[i].nextTry = 0;
     }
-    if (g_task) return true;
-    // Результат создания потока ПРОВЕРЯЕТСЯ. Стек потока живёт только во внутренней
-    // памяти (ограничение системы), и когда её в момент старта не хватает, поток молча
-    // не рождается: begin рапортует успех, на экране вечные нули, в журнале тишина —
-    // ровно та картина, которую мы наблюдали. Отказ теперь называет себя.
-    if (xTaskCreatePinnedToCore(trackerTask, "vual-tracker", 10240, nullptr, 1,
-                                &g_task, 0) != pdPASS) {
-        g_task = nullptr;
-        char m[80];
-        snprintf(m, sizeof(m), "поток не создался (внутренней свободно %lu Б)",
-                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-        store::log("tracker", m);
-        return false;
-    }
-    store::log("tracker", "рельса поднята");
-    return g_task != nullptr;
+    // Готовность рельсы — это настроенные ячейки и буфер. Крутит их общий поток рельс,
+    // созданный в main: своего у рельсы больше нет, и проверять его бессмысленно.
+    store::log("tracker", "рельса готова");
+    return true;
 }
 
 bool connected() {
@@ -312,6 +291,18 @@ void sendOffer(const char* roomHex, const uint8_t offerId[20], const char* body)
 
 void sendAnswer(const char* roomHex, const uint8_t offerId[20], const char* body) {
     for (auto& nd : g_node) if (nd.open) sendAnnounce(nd, roomHex, offerId, body, 'a');
+}
+
+/**
+ * Один шаг обслуживания. Своего потока у рельсы больше НЕТ.
+ *
+ * Три отдельных потока стоили двадцати восьми килобайт ВНУТРЕННЕЙ памяти на стеки —
+ * той самой, которой не хватало соединениям. Теперь все рельсы крутит один общий поток,
+ * а освободившееся уходит на сами подключения.
+ */
+void poll() {
+    if (!WiFi.isConnected()) return;
+    for (size_t i = 0; i < kMaxOpen; ++i) pumpNode(i);
 }
 
 void setOnMessage(OnMessage cb) { g_onMessage = cb; }

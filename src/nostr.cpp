@@ -31,7 +31,6 @@ struct Node {
 Node g_node[kMaxOpen];
 uint8_t g_peerId[20] = {};
 OnMessage g_onMessage = nullptr;
-TaskHandle_t g_task = nullptr;
 
 /** Ключ подписи. Свой, отдельный от переписки: узлы видят его открыто, и связывать его с
  *  личностью значило бы выдавать её всякому, кто читает поток событий. */
@@ -46,7 +45,7 @@ size_t g_roomCount = 0;
 /** Приёмный буфер — во ВНЕШНЕЙ памяти: он держится всё время работы и занимает место,
  *  которого во внутренней не хватало защищённым соединениям. */
 char* g_buf = nullptr;
-constexpr size_t kBufSize = 4096;
+constexpr size_t kBufSize = 4096;   // во внешней памяти: узлов теперь одиннадцать
 
 void toHex(const uint8_t* in, size_t len, char* out) {
     static const char* d = "0123456789abcdef";
@@ -235,14 +234,6 @@ void pumpNode(size_t slot) {
 
 /** Свой поток на втором ядре — по той же причине, что и у первой рельсы: подключение
  *  занимает секунды, и держать ими главный цикл нельзя. */
-void nostrTask(void*) {
-    for (;;) {
-        if (WiFi.isConnected()) {
-            for (size_t i = 0; i < kMaxOpen; ++i) pumpNode(i);
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
 
 void b64(const uint8_t* in, size_t len, char* out, size_t cap) {
     static const char* kAlpha =
@@ -284,22 +275,10 @@ bool begin(const uint8_t myPeerId[20]) {
         g_node[i].nextTry = 0;
     }
 
-    if (g_task) return true;
-    // Результат создания потока ПРОВЕРЯЕТСЯ. Стек потока живёт только во внутренней
-    // памяти (ограничение системы), и когда её в момент старта не хватает, поток молча
-    // не рождается: begin рапортует успех, на экране вечные нули, в журнале тишина —
-    // ровно та картина, которую мы наблюдали. Отказ теперь называет себя.
-    if (xTaskCreatePinnedToCore(nostrTask, "vual-nostr", 10240, nullptr, 1,
-                                &g_task, 0) != pdPASS) {
-        g_task = nullptr;
-        char m[80];
-        snprintf(m, sizeof(m), "поток не создался (внутренней свободно %lu Б)",
-                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-        store::log("nostr", m);
-        return false;
-    }
-    store::log("nostr", "рельса поднята");
-    return g_task != nullptr;
+    // Готовность рельсы — это настроенные ячейки и буфер. Крутит их общий поток рельс,
+    // созданный в main: своего у рельсы больше нет, и проверять его бессмысленно.
+    store::log("nostr", "рельса готова");
+    return true;
 }
 
 bool connected() {
@@ -372,6 +351,18 @@ void sendAnswer(const char* roomHex, const uint8_t offerId[20], const char* body
 void sendRaw(const char* roomHex, const char* json) {
     if (!roomHex || !json) return;
     publish(roomHex, json);
+}
+
+/**
+ * Один шаг обслуживания. Своего потока у рельсы больше НЕТ.
+ *
+ * Три отдельных потока стоили двадцати восьми килобайт ВНУТРЕННЕЙ памяти на стеки —
+ * той самой, которой не хватало соединениям. Теперь все рельсы крутит один общий поток,
+ * а освободившееся уходит на сами подключения.
+ */
+void poll() {
+    if (!WiFi.isConnected()) return;
+    for (size_t i = 0; i < kMaxOpen; ++i) pumpNode(i);
 }
 
 void setOnMessage(OnMessage cb) { g_onMessage = cb; }

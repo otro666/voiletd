@@ -24,6 +24,7 @@
 #include "psram.h"
 
 #include <esp_netif.h>
+#include <esp_heap_caps.h>
 #include "rail.h"
 #include "nostr.h"
 #include "tracker.h"
@@ -291,6 +292,56 @@ static bool       haveCal_ = false;
 /** Внешний адрес ещё не спрошен. Спрашиваем из общего цикла, а не при подключении:
  *  опрос семи серверов занимает секунды, и в момент подключения он не нужен. */
 static bool       needExternal_ = false;
+
+/**
+ * Общий поток всех рельс.
+ *
+ * Раньше рельсы держали ТРИ своих потока, и только на их стеки уходило двадцать восемь
+ * килобайт внутренней памяти — при сорока трёх свободных. Отсюда и «1 из 6» вместо
+ * полного набора: на сами соединения не оставалось ничего.
+ *
+ * Теперь поток один, и его стек лежит во ВНЕШНЕЙ памяти — тех самых восьми мегабайтах,
+ * которые до сих пор простаивали. Внутренняя целиком достаётся соединениям.
+ */
+static StaticTask_t g_railsTcb;
+static StackType_t* g_railsStack = nullptr;
+static TaskHandle_t g_railsTask = nullptr;
+
+static void railsTask(void*) {
+    for (;;) {
+        rail::poll();
+        nostr::poll();
+        tracker::poll();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void startRailsTask() {
+    if (g_railsTask) return;
+
+    constexpr size_t kStackWords = 12288;      // 48 КБ: рукопожатию TLS нужен запас
+
+    // Стек во внешней памяти разрешён НЕ в каждой сборке платформы. Если разрешения нет,
+    // система не возвращает ошибку — она обрывает работу проверкой внутри себя, и плата
+    // уходит в перезагрузку по кругу. Поэтому спрашиваем разрешение на этапе сборки: есть
+    // — кладём стек снаружи, нет — оставляем внутри, но поток всё равно ОДИН вместо трёх,
+    // и это само по себе освобождает около двадцати килобайт.
+#ifdef CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    g_railsStack = static_cast<StackType_t*>(
+        heap_caps_malloc(kStackWords * sizeof(StackType_t), MALLOC_CAP_SPIRAM));
+    if (g_railsStack) {
+        g_railsTask = xTaskCreateStaticPinnedToCore(
+            railsTask, "vual-rails", kStackWords, nullptr, 1,
+            g_railsStack, &g_railsTcb, 0);
+    }
+#endif
+    if (!g_railsTask) {
+        xTaskCreatePinnedToCore(railsTask, "vual-rails", 8192, nullptr, 1, &g_railsTask, 0);
+        store::log("rails", "поток рельс: стек внутри (внешний не разрешён сборкой)");
+    } else {
+        store::log("rails", "поток рельс: стек во внешней памяти");
+    }
+}
 
 static void bridgeNetToRadio(const uint8_t meetAddr[4], const uint8_t* payload, size_t len);
 static void announceRadio();
@@ -1371,6 +1422,7 @@ static void connectWifi() {
             store::log("net", "IPv6 недоступен");
     }
 
+    startRailsTask();
     if (!rail::begin(net::myId())) store::log("rail", "рельса брокеров не запущена");
     rail::setOnMessage(onRailMessage);
 
@@ -2024,7 +2076,8 @@ void setup() {
                     else
                         store::log("net", "IPv6 недоступен");
                 }
-                if (!rail::begin(net::myId())) store::log("rail", "рельса брокеров не запущена");
+                startRailsTask();
+    if (!rail::begin(net::myId())) store::log("rail", "рельса брокеров не запущена");
                 rail::setOnMessage(onRailMessage);
                 if (!nostr::begin(net::myId())) store::log("nostr", "рельса Nostr не запущена");
                 nostr::setOnMessage(onNostrMessage);
