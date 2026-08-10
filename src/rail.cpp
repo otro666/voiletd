@@ -180,8 +180,13 @@ bool field(const char* json, const char* key, char* out, size_t cap) {
     const char* p = strstr(json, pat);
     if (!p) return false;
     p += strlen(pat);
-    const char* e = strchr(p, '"');
-    if (!e) return false;
+    // Конец строки ищем, УВАЖАЯ экранирование: визитка телефонной версии лежит внутри
+    // поля строкой, и её собственные кавычки записаны как \". Наивный поиск первой
+    // кавычки обрезал бы визитку на третьем символе — а обрезанную не спасёт ни
+    // проверка подписи, ни что-либо ещё.
+    const char* e = p;
+    while (*e && !(*e == '"' && e[-1] != '\\')) ++e;
+    if (!*e) return false;
     const size_t n = size_t(e - p) < cap - 1 ? size_t(e - p) : cap - 1;
     memcpy(out, p, n);
     out[n] = 0;
@@ -433,6 +438,11 @@ void sendAnswer(const char* roomHex, const uint8_t offerId[20], const char* body
              "{\"v\":1,\"t\":\"a\",\"ih\":\"%s\",\"pid\":\"%s\",\"oid\":\"%s\",\"sdp\":\"%s\"}",
              roomHex, pid, oid, body ? body : "");
     for (auto& c : g_conn) if (c.open) sendPublish(c, roomHex, msg);
+}
+
+void sendRaw(const char* roomHex, const char* json) {
+    if (!roomHex || !json) return;
+    for (auto& c : g_conn) if (c.open) sendPublish(c, roomHex, json);
 }
 
 void setOnMessage(OnMessage cb) { g_onMessage = cb; }

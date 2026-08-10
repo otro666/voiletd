@@ -209,6 +209,8 @@ void pumpNode(size_t slot) {
         // Перебираем список по кругу, каждая ячейка со своим смещением: так три ячейки
         // не толкутся на одних и тех же узлах и вместе перебирают все двадцать пять.
         nd.which = (nd.which + kMaxOpen) % relays::kNostrCount;
+        // Шаг по списку — ПО ОДНОМУ узлу за отказ, а не через размер набора: так за
+        // несколько минут перебираются ВСЕ узлы списка, а не одни и те же три.
 
         if (!ws::open(nd.sock, nd.cli, relays::kNostr[nd.which], 443, "/", nullptr)) {
             return;
@@ -365,6 +367,11 @@ void sendAnswer(const char* roomHex, const uint8_t offerId[20], const char* body
              "\\\"oid\\\":\\\"%s\\\",\\\"sdp\\\":\\\"%s\\\"}",
              roomHex, pid, oid, body ? body : "");
     publish(roomHex, msg);
+}
+
+void sendRaw(const char* roomHex, const char* json) {
+    if (!roomHex || !json) return;
+    publish(roomHex, json);
 }
 
 void setOnMessage(OnMessage cb) { g_onMessage = cb; }

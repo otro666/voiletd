@@ -266,6 +266,8 @@ static size_t     phraseLen_ = 0;
 static char       myName_[24] = {};
 /** Комната текущего знакомства и ключ, которым закрыт обмен в ней. */
 static char       pairRoom_[41] = {};
+/** Комната «набора» — та, в которой лежат визитки телефонной версии. */
+static char       phoneRoom_[41] = {};
 /** Журнал для показа: строки и буфер под них. */
 static char       logBuf_[3000] = {};
 static const char* logLines_[64] = {};
@@ -791,6 +793,11 @@ static void addPeerFromBody(const char* body, const uint8_t peerId[20]) {
 }
 
 static void onRailMessage(const rail::Incoming& in) {
+    // Комната «набора» — это разговор с телефонной версией, у него свой разбор.
+    if (phoneRoom_[0] && strcmp(in.room, phoneRoom_) == 0) {
+        phone::onRailIncoming(in.kind, in.offerId, in.body);
+        return;
+    }
     // Не наша комната — не наше дело.
     if (pairRoom_[0] == 0 || strcmp(in.room, pairRoom_) != 0) return;
 
@@ -1523,6 +1530,17 @@ static void handleEvent(const input::Event& e) {
             nostr::joinRoom(roomHex);
             nostr::announce(roomHex);
             tracker::joinRoom(roomHex);
+
+            // И ВТОРАЯ комната — «набор» (SHA-1 "vual1-d:"+фраза). Именно в неё телефон
+            // кладёт визитки; комната выше — «присутствие», визиток там не бывает.
+            // Подписки на неё не было вовсе: дек рассылал бы предложения в пустоту и не
+            // слышал ответов, даже когда всё остальное работает.
+            phone::roomHexOut(phoneRoom_);
+            if (phoneRoom_[0]) {
+                rail::joinRoom(phoneRoom_);
+                nostr::joinRoom(phoneRoom_);
+                tracker::joinRoom(phoneRoom_);
+            }
 
             char msg[96];
             if (rail::connected() || nostr::connected() || tracker::connected())

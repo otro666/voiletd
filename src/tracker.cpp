@@ -121,7 +121,10 @@ void sendAnnounce(Node& nd, const char* room, const uint8_t* offerId,
     binToJsonString(ihBin, 20, ih, sizeof(ih));
     binToJsonString(g_peerId, 20, pid, sizeof(pid));
 
-    static char msg[1200];
+    // 2560 байт: визитка с экранированием занимает под тысячу, плюс обёртка объявления.
+    // В прежние 1200 она влезала впритык, а обрезанная визитка бесполезна — подпись
+    // по ней не сойдётся, и разбираться в причине пришлось бы по чужим логам.
+    static char msg[2560];
     int n;
     if (kind == 'p') {
         // Просто объявляемся и просим показать соседей.
@@ -197,6 +200,8 @@ void pumpNode(size_t slot) {
 
         // Перебираем список со смещением, чтобы три ячейки не толклись на одних узлах.
         nd.which = (nd.which + kMaxOpen) % relays::kTrackerCount;
+        // Шаг по списку — ПО ОДНОМУ узлу за отказ, а не через размер набора: так за
+        // несколько минут перебираются ВСЕ узлы списка, а не одни и те же три.
         const relays::Tracker& t = relays::kTrackers[nd.which];
 
         if (!ws::open(nd.sock, nd.cli, t.host, t.port, t.path, nullptr)) return;

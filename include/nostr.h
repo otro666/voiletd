@@ -49,7 +49,7 @@ struct Incoming {
     uint8_t peerId[20];
     uint8_t offerId[20];
     bool hasOffer;
-    char body[512];
+    char body[1200];   // визитка телефона длиннее прежнего буфера — см. rail.h
 };
 
 using OnMessage = void (*)(const Incoming&);
@@ -71,6 +71,15 @@ void announce(const char* roomHex);
 /** Предложение связи и ответ на чужое. */
 void sendOffer(const char* roomHex, const uint8_t offerId[20], const char* body);
 void sendAnswer(const char* roomHex, const uint8_t offerId[20], const char* body);
+
+/**
+ * Отправить в комнату ГОТОВЫЙ кадр — как есть, без сборки обёртки.
+ *
+ * Нужно для телефонной версии: у неё свой формат рельсового сообщения (визитка лежит
+ * строкой с экранированием), и собирать его должен тот, кто знает этот формат, а не
+ * рельса. Рельса здесь — только труба.
+ */
+void sendRaw(const char* roomHex, const char* json);
 
 void setOnMessage(OnMessage cb);
 

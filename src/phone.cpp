@@ -4,6 +4,9 @@
 #include "cloak.h"
 #include "contacts.h"
 #include "net.h"
+#include "rail.h"
+#include "nostr.h"
+#include "tracker.h"
 #include "store_sd.h"
 #include "voile_crypto.h"
 
@@ -26,6 +29,8 @@
 #include <esp_random.h>
 #include <esp_netif.h>
 #include <lwip/ip6_addr.h>
+#include <lwip/ip_addr.h>
+#include <lwip/netdb.h>
 
 namespace phone {
 
@@ -70,6 +75,15 @@ size_t b64u(const uint8_t* in, size_t len, char* out, size_t cap) {
         else if (out[i] == '/') out[i] = '_';
     }
     return n;
+}
+
+/** Обычное основание 64 — им записаны идентификаторы в рельсовом кадре (Bytes.b64). */
+size_t unb64(const char* in, uint8_t* out, size_t cap) {
+    size_t got = 0;
+    if (mbedtls_base64_decode(out, cap, &got,
+                              reinterpret_cast<const unsigned char*>(in), strlen(in)) != 0)
+        return 0;
+    return got;
 }
 
 size_t unb64u(const char* in, uint8_t* out, size_t cap) {
@@ -169,6 +183,42 @@ bool jsonArrAt(const char* json, const char* key, size_t idx, char* out, size_t 
     return false;
 }
 
+/**
+ * Записать строку JSON внутрь другой строки JSON.
+ *
+ * Телефон кладёт визитку в поле «sdp» ИМЕННО строкой (Wire.RailWire.sdp — строка), а не
+ * вложенным объектом. Мой первый вариант клал объект: у телефона это поле читается как
+ * текст, и разбор визитки ломался бы на первой же кавычке. Экранируем кавычки и косые.
+ */
+size_t jsonEscape(const char* in, char* out, size_t cap) {
+    size_t o = 0;
+    for (const char* p = in; *p && o + 2 < cap; ++p) {
+        if (*p == '"' || *p == '\\') { out[o++] = '\\'; out[o++] = *p; }
+        else if (*p == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else out[o++] = *p;
+    }
+    out[o] = 0;
+    return o;
+}
+
+/** Обратная операция: снять экранирование со строки визитки. */
+size_t jsonUnescape(const char* in, size_t len, char* out, size_t cap) {
+    size_t o = 0;
+    for (size_t i = 0; i < len && o + 1 < cap; ++i) {
+        if (in[i] == '\\' && i + 1 < len) {
+            ++i;
+            switch (in[i]) {
+                case 'n': out[o++] = '\n'; break;
+                case 't': out[o++] = '\t'; break;
+                case '/': out[o++] = '/';  break;
+                default:  out[o++] = in[i];
+            }
+        } else out[o++] = in[i];
+    }
+    out[o] = 0;
+    return o;
+}
+
 // ── состояние ─────────────────────────────────────────────────────────────────────────
 
 constexpr char kVersion[] = "voile/1";
@@ -183,6 +233,7 @@ uint8_t  g_nonce[16] = {};
 uint8_t  g_oid[kIdLen] = {};           // идентификатор нашего предложения
 uint8_t  g_pid[kIdLen] = {};           // наш «peer id» для рельсовых сообщений
 char     g_answeredOid[40] = {};       // на этот оффер мы уже ответили
+uint8_t  g_stunTxn[12] = {};           // признак нашего запроса STUN
 char     g_myCard[kMaxCard] = {};      // своя визитка, JSON
 char     g_myX[64] = {}, g_myY[64] = {};
 
@@ -233,6 +284,91 @@ char     g_asm[kMaxCard] = {};
 char     g_asmId[16] = {};
 uint8_t  g_asmHave = 0, g_asmTotal = 0;
 char     g_asmPart[6][400] = {};
+
+// ── внешний адрес через STUN ──────────────────────────────────────────────────────────
+//
+// Зачем. Домашний роутер прячет плату за общим адресом: снаружи виден его адрес и порт,
+// а не наши. Телефон именно так и делает — в его логе видно «внешний адрес от
+// stun.cloudflare.com». Без такого кандидата визитка платы годится только для одной
+// Wi-Fi: через интернет телефону просто некуда стучаться.
+//
+// Спрашивать надо ТЕМ ЖЕ сокетом, которым потом слушаем: роутер запоминает соответствие
+// «внутренний порт — внешний», и адрес, полученный чужим сокетом, ведёт в никуда.
+
+/** Список серверов — телефонный, чтобы обе стороны видели одинаковую картину. */
+struct StunServer { const char* host; uint16_t port; };
+const StunServer kStun[] = {
+    {"stun.cloudflare.com", 3478},
+    {"stun.l.google.com",   19302},
+    {"stun.sipnet.net",     3478},
+    {"stun.nextcloud.com",  443},
+    {"stun.miwifi.com",     3478},
+};
+constexpr size_t kStunCount = sizeof(kStun) / sizeof(kStun[0]);
+
+char     g_extAddr[48] = {};       // «адрес:порт» снаружи, пустая строка — неизвестен
+uint32_t g_stunAt = 0;             // когда спрашивали в последний раз
+size_t   g_stunWhich = 0;
+
+/** Отправить запрос STUN. Запрос простой: заголовок из двадцати байт без свойств. */
+void stunAsk() {
+    if (g_fd < 0) return;
+    const StunServer& sv = kStun[g_stunWhich % kStunCount];
+    ++g_stunWhich;
+
+    // Адрес сервера: сперва пробуем разобрать как есть, иначе спрашиваем имя у системы.
+    ip_addr_t addr;
+    if (!ipaddr_aton(sv.host, &addr)) {
+        struct hostent* he = gethostbyname(sv.host);
+        if (!he || !he->h_addr_list[0]) return;
+        memcpy(&addr, he->h_addr_list[0], sizeof(uint32_t));
+        addr.type = IPADDR_TYPE_V4;
+    }
+
+    uint8_t req[20] = {};
+    req[0] = 0x00; req[1] = 0x01;                 // связывание
+    req[4] = 0x21; req[5] = 0x12; req[6] = 0xA4; req[7] = 0x42;   // волшебное число
+    esp_fill_random(req + 8, 12);                 // опознавательный признак запроса
+    memcpy(g_stunTxn, req + 8, 12);
+
+    sockaddr_in6 sa;
+    v4mapped(ip_addr_get_ip4_u32(&addr), sv.port, sa);
+    sendto(g_fd, req, sizeof(req), 0,
+           reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+}
+
+/**
+ * Разобрать ответ STUN. Берём свойство XOR-MAPPED-ADDRESS: адрес в нём смешан с
+ * волшебным числом — так его не портят роутеры, переписывающие адреса внутри пакетов.
+ */
+bool stunParse(const uint8_t* buf, size_t len) {
+    if (len < 20 || buf[0] != 0x01 || buf[1] != 0x01) return false;      // не ответ
+    if (memcmp(buf + 8, g_stunTxn, 12) != 0) return false;               // не на наш запрос
+
+    size_t o = 20;
+    const size_t end = 20 + size_t((buf[2] << 8) | buf[3]);
+    while (o + 4 <= len && o + 4 <= end) {
+        const uint16_t type = uint16_t((buf[o] << 8) | buf[o + 1]);
+        const uint16_t alen = uint16_t((buf[o + 2] << 8) | buf[o + 3]);
+        const uint8_t* v = buf + o + 4;
+        if (o + 4 + alen > len) break;
+
+        if ((type == 0x0020 || type == 0x0001) && alen >= 8) {
+            const bool xored = (type == 0x0020);
+            const uint16_t port = uint16_t(((v[2] << 8) | v[3]) ^ (xored ? 0x2112 : 0));
+            if (v[1] == 0x01) {                                   // IPv4
+                uint8_t ip[4];
+                for (int i = 0; i < 4; ++i)
+                    ip[i] = uint8_t(v[4 + i] ^ (xored ? (0x2112A442u >> (24 - 8 * i)) : 0));
+                snprintf(g_extAddr, sizeof(g_extAddr), "%u.%u.%u.%u:%u",
+                         ip[0], ip[1], ip[2], ip[3], unsigned(port));
+                return true;
+            }
+        }
+        o += 4 + alen + ((4 - (alen & 3)) & 3);                   // выравнивание свойств
+    }
+    return false;
+}
 
 // ── криптография визитки ──────────────────────────────────────────────────────────────
 
@@ -454,8 +590,11 @@ bool buildCard() {
     // IPv6 добавляем ПЕРВЫМ делом, если он есть: телефонная версия ходит по IPv6
     // предпочтительно (в её коде это прямо заявлено), и без такого кандидата встреча
     // в сетях, где IPv4 за общим адресом, просто не состоится.
-    char eps[2][48];
+    char eps[3][48];
     size_t epCount = 0;
+
+    // Внешний адрес — ПЕРВЫМ по важности: только через него нас достанут из другой сети.
+    if (g_extAddr[0]) snprintf(eps[epCount++], sizeof(eps[0]), "%s", g_extAddr);
 
     // Сперва глобальный адрес, при его отсутствии — локальный для звена: в домашней
     // сети собеседник всё равно за тем же маршрутизатором, и локального хватает.
@@ -474,10 +613,12 @@ bool buildCard() {
              ip[0], ip[1], ip[2], ip[3], unsigned(g_sockPort));
 
     // Подпись накрывает кандидатов ОТСОРТИРОВАННЫМИ — как у телефона (eps.sorted()).
-    if (epCount == 2 && strcmp(eps[0], eps[1]) > 0) {
-        char tmp[48];
-        strcpy(tmp, eps[0]); strcpy(eps[0], eps[1]); strcpy(eps[1], tmp);
-    }
+    for (size_t a = 0; a + 1 < epCount; ++a)
+        for (size_t b = a + 1; b < epCount; ++b)
+            if (strcmp(eps[a], eps[b]) > 0) {
+                char tmp[48];
+                strcpy(tmp, eps[a]); strcpy(eps[a], eps[b]); strcpy(eps[b], tmp);
+            }
 
     char t[768];
     const size_t tlen = cardTranscript(t, sizeof(t), g_myX, g_myY, ephB64, nonceB64,
@@ -490,9 +631,11 @@ bool buildCard() {
     char sigB64[128];
     b64u(sig, siglen, sigB64, sizeof(sigB64));
 
-    char epsJson[110];
-    if (epCount == 2) snprintf(epsJson, sizeof(epsJson), "\"%s\",\"%s\"", eps[0], eps[1]);
-    else              snprintf(epsJson, sizeof(epsJson), "\"%s\"", eps[0]);
+    char epsJson[170];
+    int eo = 0;
+    for (size_t i = 0; i < epCount; ++i)
+        eo += snprintf(epsJson + eo, sizeof(epsJson) - size_t(eo), "%s\"%s\"",
+                       i ? "," : "", eps[i]);
 
     const int n = snprintf(g_myCard, sizeof(g_myCard),
         "{\"v\":\"%s\",\"x\":\"%s\",\"y\":\"%s\",\"eph\":\"%s\",\"n\":\"%s\","
@@ -669,65 +812,100 @@ bool dhtSend(const net::Neighbour* nb, uint8_t type, const uint8_t* body, size_t
     return sockSend(to, sealed, sn);
 }
 
-/** Положить своё предложение в комнату (DHT STORE), как это делает DhtRail.publish. */
-void publishOffer() {
-    if (!g_haveRoom || !g_myCard[0]) return;
-
-    char pidB64[40], oidB64[40];
-    b64(g_pid, sizeof(g_pid), pidB64, sizeof(pidB64));
-    b64(g_oid, sizeof(g_oid), oidB64, sizeof(oidB64));
-
-    // Рельсовое сообщение: тип «o» — предложение, внутри наша визитка (Wire.encodeRail).
-    static char wire[kMaxCard + 256];
+/**
+ * Собрать рельсовый кадр телефонного формата: {"v":1,"t":..,"ih":..,"pid":..,"oid":..,"sdp":".."}.
+ * Визитка идёт СТРОКОЙ с экранированием — так её кладёт телефон (Wire.encodeRail).
+ */
+size_t buildWire(char* out, size_t cap, char type, const char* oidB64) {
     char ihHex[41];
     for (size_t i = 0; i < kIdLen; ++i) snprintf(ihHex + i * 2, 3, "%02x", g_roomD[i]);
-    const int wn = snprintf(wire, sizeof(wire),
-        "0|{\"v\":1,\"t\":\"o\",\"ih\":\"%s\",\"pid\":\"%s\",\"oid\":\"%s\",\"sdp\":%s}",
-        ihHex, pidB64, oidB64, g_myCard);
-    if (wn <= 0) return;
-
-    // Значение DHT: ключ комнаты и следом тело.
-    static uint8_t body[kMaxCard + 300];
-    memcpy(body, g_roomD, kIdLen);
-    size_t total = size_t(wn);
-    if (kIdLen + total > sizeof(body)) return;
-    memcpy(body + kIdLen, wire, total);
-
-    size_t sent = 0;
-    for (size_t i = 0; i < net::neighbourCount(); ++i) {
-        if (dhtSend(net::neighbourAt(i), D_STORE, body, kIdLen + total)) ++sent;
-    }
-    if (sent) store::log("phone", "предложение положено в комнату");
-}
-
-/**
- * Ответить на чужое предложение: тот же рельсовый кадр, но тип «a» и идентификатор
- * ЧУЖОГО оффера — по нему отвечающая сторона узнаёт свой (Wire.RailWire("a", …)).
- */
-void publishAnswer(const char* theirOid) {
-    if (!g_haveRoom || !g_myCard[0]) return;
-
     char pidB64[40];
     b64(g_pid, sizeof(g_pid), pidB64, sizeof(pidB64));
 
-    static char wire[kMaxCard + 256];
-    char ihHex[41];
-    for (size_t i = 0; i < kIdLen; ++i) snprintf(ihHex + i * 2, 3, "%02x", g_roomD[i]);
-    const int wn = snprintf(wire, sizeof(wire),
-        "0|{\"v\":1,\"t\":\"a\",\"ih\":\"%s\",\"pid\":\"%s\",\"oid\":\"%s\",\"sdp\":%s}",
-        ihHex, pidB64, theirOid, g_myCard);
-    if (wn <= 0) return;
+    static char escaped[kMaxCard * 2];
+    jsonEscape(g_myCard, escaped, sizeof(escaped));
 
-    static uint8_t body[kMaxCard + 300];
-    memcpy(body, g_roomD, kIdLen);
-    if (kIdLen + size_t(wn) > sizeof(body)) return;
-    memcpy(body + kIdLen, wire, size_t(wn));
-
-    size_t sent = 0;
-    for (size_t i = 0; i < net::neighbourCount(); ++i)
-        if (dhtSend(net::neighbourAt(i), D_STORE, body, kIdLen + size_t(wn))) ++sent;
-    if (sent) store::log("phone", "ответ положен в комнату");
+    const int n = snprintf(out, cap,
+        "{\"v\":1,\"t\":\"%c\",\"ih\":\"%s\",\"pid\":\"%s\",\"oid\":\"%s\",\"sdp\":\"%s\"}",
+        type, ihHex, pidB64, oidB64, escaped);
+    return n > 0 && size_t(n) < cap ? size_t(n) : 0;
 }
+
+/** Комната в шестнадцатеричном виде — рельсы принимают её строкой. */
+void roomHex(char out[41]) {
+    for (size_t i = 0; i < kIdLen; ++i) snprintf(out + i * 2, 3, "%02x", g_roomD[i]);
+}
+
+/**
+ * Разослать кадр ПО ВСЕМ рельсам и заодно положить в DHT.
+ *
+ * Это главное исправление знакомства. Раньше визитка уходила ТОЛЬКО прямым запросом
+ * соседям по локальной сети — а телефон рассылает свою по брокерам и Nostr (в его логе:
+ * «→ 'o' в … (все рельсы)»). Стороны искали друг друга в разных местах и не могли
+ * встретиться нигде, кроме одной Wi-Fi. Теперь дек делает ровно то же, что телефон.
+ */
+void publishWire(char type, const char* oidB64) {
+    if (!g_haveRoom || !g_myCard[0]) return;
+
+    static char wire[kMaxCard * 2 + 300];
+    const size_t wn = buildWire(wire, sizeof(wire), type, oidB64);
+    if (!wn) { store::log("phone", "кадр знакомства не собрался"); return; }
+
+    char room[41];
+    roomHex(room);
+
+    // Рельсы: брокеры и Nostr — тот же путь, которым ходит телефон.
+    rail::sendRaw(room, wire);
+    nostr::sendRaw(room, wire);
+
+    // Трекеры. Телефон сейчас кладёт туда визитки своего пути WebRTC, а не эти кадры,
+    // так что встречи через них пока не будет. Шлём осознанно, на будущее: формат
+    // объявления трекера несёт визитку в поле «sdp», и когда появятся звонки через
+    // интернет, этот путь уже будет живым — трекеры отвечают там, где брокеры закрыты.
+    {
+        static char escaped[kMaxCard * 2];
+        jsonEscape(g_myCard, escaped, sizeof(escaped));
+        uint8_t oidBin[kIdLen];
+        if (type == 'o') {
+            memcpy(oidBin, g_oid, kIdLen);
+            tracker::sendOffer(room, oidBin, escaped);
+        } else if (unb64u(oidB64, oidBin, sizeof(oidBin)) == kIdLen ||
+                   unb64(oidB64, oidBin, sizeof(oidBin)) == kIdLen) {
+            tracker::sendAnswer(room, oidBin, escaped);
+        }
+    }
+
+    // И DHT — для случая, когда обе стороны в одной сети без интернета.
+    size_t viaDht = 0;
+    if (net::neighbourCount() > 0) {
+        static char value[kMaxCard * 2 + 320];
+        const int vn = snprintf(value, sizeof(value), "0|%s", wire);
+        if (vn > 0) {
+            static uint8_t body[kMaxCard * 2 + 360];
+            memcpy(body, g_roomD, kIdLen);
+            if (kIdLen + size_t(vn) <= sizeof(body)) {
+                memcpy(body + kIdLen, value, size_t(vn));
+                for (size_t i = 0; i < net::neighbourCount(); ++i)
+                    if (dhtSend(net::neighbourAt(i), D_STORE, body, kIdLen + size_t(vn))) ++viaDht;
+            }
+        }
+    }
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s разослан(о): рельсы + DHT %u",
+             type == 'o' ? "предложение" : "ответ", unsigned(viaDht));
+    store::log("phone", msg);
+}
+
+/** Положить своё предложение — во все рельсы сразу. */
+void publishOffer() {
+    char oidB64[40];
+    b64(g_oid, sizeof(g_oid), oidB64, sizeof(oidB64));
+    publishWire('o', oidB64);
+}
+
+/** Ответить на чужое предложение: тип «a» и ЧУЖОЙ идентификатор оффера. */
+void publishAnswer(const char* theirOid) { publishWire('a', theirOid); }
 
 /** Спросить комнату (DHT FIND_VALUE). */
 void pollRoom() {
@@ -837,11 +1015,16 @@ bool acceptCard(const char* cardJson, bool iAmInitiator) {
 }
 
 /** Разбор значения комнаты: целое «0|…» или часть «1|id|номер|всего|…». */
-void onRoomValue(const char* v, size_t len) {
+void onRoomValue(const char* v, size_t len, bool fromRail = false) {
     if (len < 2) return;
-    static char whole[kMaxCard + 256];
+    static char whole[kMaxCard * 2 + 256];
 
-    if (v[0] == '0' && v[1] == '|') {
+    if (fromRail) {
+        // С рельсы кадр приходит как есть, без обёртки частей — она только у DHT.
+        if (len >= sizeof(whole)) return;
+        memcpy(whole, v, len);
+        whole[len] = 0;
+    } else if (v[0] == '0' && v[1] == '|') {
         if (len - 2 >= sizeof(whole)) return;
         memcpy(whole, v + 2, len - 2);
         whole[len - 2] = 0;
@@ -890,10 +1073,22 @@ void onRoomValue(const char* v, size_t len) {
     b64(g_pid, sizeof(g_pid), myPid, sizeof(myPid));
     if (jsonStr(whole, "pid", pid, sizeof(pid)) && strcmp(pid, myPid) == 0) return;
 
+    // Визитка лежит в «sdp» СТРОКОЙ с экранированием (так её кладёт телефон), но старые
+    // сборки платы клали объект — принимаем оба вида, чтобы не разойтись на переходе.
     const char* sdp = strstr(whole, "\"sdp\":");
     if (!sdp) return;
     sdp += 6;
-    if (*sdp != '{') return;                      // визитка — вложенный объект
+    static char card[kMaxCard];
+    if (*sdp == '"') {
+        ++sdp;
+        const char* end = sdp;
+        while (*end && !(*end == '"' && end[-1] != '\\')) ++end;
+        if (!*end) return;
+        jsonUnescape(sdp, size_t(end - sdp), card, sizeof(card));
+        sdp = card;
+    } else if (*sdp != '{') {
+        return;
+    }
 
     if (t[0] == 'a') {
         // Ответ на НАШЕ предложение: сверяем, что отвечают именно нам.
@@ -921,6 +1116,18 @@ void onRoomValue(const char* v, size_t len) {
     }
 }
 
+/**
+ * Кадр знакомства пришёл С РЕЛЬСЫ (брокер или Nostr). Разбор общий с локальным DHT:
+ * формат кадра один и тот же, отличается только транспорт.
+ */
+void railWireImpl(const char* roomHexIn, const char* json) {
+    if (!g_haveRoom || !json) return;
+    char mine[41];
+    roomHex(mine);
+    if (!roomHexIn || strcasecmp(roomHexIn, mine) != 0) return;   // не наша комната
+    onRoomValue(json, strlen(json), /*fromRail=*/true);
+}
+
 /** Приём на сокете сессии: ответы DHT и кадры линка. Сокет неблокирующий. */
 void readSocket() {
     if (g_fd < 0) return;
@@ -931,6 +1138,15 @@ void readSocket() {
         const int n = recvfrom(g_fd, buf, sizeof(buf), 0,
                                reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n <= 0) return;                       // пусто — до следующего круга
+
+        // Ответ STUN узнаётся по первым байтам и нашему признаку запроса.
+        if (n >= 20 && buf[0] == 0x01 && stunParse(buf, size_t(n))) {
+            char m[80];
+            snprintf(m, sizeof(m), "внешний адрес: %s", g_extAddr);
+            store::log("phone", m);
+            buildCard();          // визитку пересобираем — теперь с внешним адресом
+            continue;
+        }
 
         // Сперва линк: если он поднят, большая часть пакетов именно его.
         if (g_linked) {
@@ -989,6 +1205,44 @@ void readSocket() {
 }
 
 }  // namespace
+
+void onRailWire(const char* roomHexIn, const char* json) { railWireImpl(roomHexIn, json); }
+
+void roomHexOut(char out[41]) {
+    if (!g_haveRoom) { out[0] = 0; return; }
+    roomHex(out);
+}
+
+void onRailIncoming(char kind, const uint8_t offerId[20], const char* cardJson) {
+    if (!g_haveRoom || g_linked || !cardJson || !cardJson[0]) return;
+
+    // Разбор трекера отдаёт визитку как есть — с экранированием. Снимаем его, если оно
+    // осталось: иначе разбор полей споткнётся на первой же обратной косой.
+    static char plainCard[kMaxCard];
+    if (strstr(cardJson, "\\\"")) {
+        jsonUnescape(cardJson, strlen(cardJson), plainCard, sizeof(plainCard));
+        cardJson = plainCard;
+    }
+
+    char oid[40];
+    b64(offerId, kIdLen, oid, sizeof(oid));
+
+    if (kind == 'a') {
+        // Ответ: принимаем, только если отвечают на НАШЕ предложение.
+        char myOid[40];
+        b64(g_oid, sizeof(g_oid), myOid, sizeof(myOid));
+        if (strcmp(oid, myOid) != 0) return;
+        acceptCard(cardJson, /*iAmInitiator=*/true);
+        return;
+    }
+
+    if (kind == 'o') {
+        if (strcmp(oid, g_answeredOid) == 0) return;    // на этот уже отвечали
+        snprintf(g_answeredOid, sizeof(g_answeredOid), "%s", oid);
+        if (!acceptCard(cardJson, /*iAmInitiator=*/false)) { g_answeredOid[0] = 0; return; }
+        publishAnswer(oid);
+    }
+}
 
 // ── открытый интерфейс ────────────────────────────────────────────────────────────────
 
@@ -1085,6 +1339,13 @@ void pump() {
 
     readSocket();
     const uint32_t now = millis();
+
+    // Внешний адрес спрашиваем при запуске и обновляем раз в четыре минуты: роутер
+    // забывает соответствие портов через несколько минут молчания.
+    if (now - g_stunAt > (g_extAddr[0] ? 240000u : 5000u)) {
+        g_stunAt = now;
+        stunAsk();
+    }
 
     if (!g_linked && g_haveRoom) {
         if (net::neighbourCount() > 0) {
