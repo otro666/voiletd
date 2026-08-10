@@ -268,6 +268,15 @@ static char       myName_[24] = {};
 static char       pairRoom_[41] = {};
 /** Комната «набора» — та, в которой лежат визитки телефонной версии. */
 static char       phoneRoom_[41] = {};
+/**
+ * Каким путём идёт знакомство.
+ *
+ * Экрана знакомства два — «по радио» и «по сети», — но переменная комнаты у них была
+ * ОДНА, и планировщик радио смотрел именно на неё. Из-за этого знакомство по интернету
+ * поднимало зов в эфир: плата звала по радио телефон, у которого радио нет вовсе.
+ * Признак разделяет пути: в эфир зовём только тогда, когда человек выбрал эфир.
+ */
+static bool       pairViaRadio_ = false;
 /** Журнал для показа: строки и буфер под них. */
 static char       logBuf_[3000] = {};
 static const char* logLines_[64] = {};
@@ -380,6 +389,8 @@ static void handlePacketInner() {
                         nostr::leaveRoom(pairRoom_);
                         tracker::leaveRoom(pairRoom_);
                         pairRoom_[0] = 0;
+        pairViaRadio_ = false;
+                        pairViaRadio_ = false;
                     }
                     if (contacts::count() != before) announceRadio();
                 }
@@ -857,6 +868,7 @@ static void onRailMessage(const rail::Incoming& in) {
         nostr::leaveRoom(pairRoom_);
         tracker::leaveRoom(pairRoom_);
         pairRoom_[0] = 0;
+        pairViaRadio_ = false;
         break;
     }
 
@@ -867,6 +879,7 @@ static void onRailMessage(const rail::Incoming& in) {
         nostr::leaveRoom(pairRoom_);
         tracker::leaveRoom(pairRoom_);
         pairRoom_[0] = 0;
+        pairViaRadio_ = false;
         break;
 
     default: break;
@@ -1254,8 +1267,9 @@ static void announceRadio() {
     contacts::myAddr(me);
     memcpy(h.src, me, 4);
 
-    // Если идёт знакомство — зовём по адресу встречи, иначе объявляемся всем.
-    if (pairRoom_[0]) {
+    // По адресу встречи зовём, только если знакомство идёт ПО РАДИО. Иначе — обычное
+    // объявление всем, кто слышит.
+    if (pairViaRadio_) {
         contacts::Rendezvous rv;
         contacts::deriveRendezvous(phrase_, rv);
         memcpy(h.dst, rv.meetAddr, 4);
@@ -1277,7 +1291,7 @@ static void announceRadio() {
     memcpy(pkt + o, contacts::myPubMutable(), voile::kPubComp); o += voile::kPubComp;
 
     enqueue(pkt, o, voile::kDefaultCopies);
-    store::log("radio", pairRoom_[0] ? "зову по адресу встречи" : "объявляюсь в эфире");
+    store::log("radio", pairViaRadio_ ? "зову по адресу встречи" : "объявляюсь в эфире");
 }
 
 /** Запомнить сеть, к которой только что подключились. */
@@ -1524,6 +1538,7 @@ static void handleEvent(const input::Event& e) {
             // телефоном заканчивалось на «собеседник найден»: встретиться встретились,
             // а обменяться визитками было нечем.
             phone::setPhrase(phrase_);
+            pairViaRadio_ = false;           // знакомство по сети: эфир не трогаем
 
             rail::joinRoom(roomHex);
             rail::announce(roomHex);
@@ -1568,6 +1583,7 @@ static void handleEvent(const input::Event& e) {
             contacts::Rendezvous rv;
             contacts::deriveRendezvous(phrase_, rv);
             for (int i = 0; i < 20; ++i) snprintf(pairRoom_ + i * 2, 3, "%02x", rv.phoneRoom[i]);
+            pairViaRadio_ = true;            // человек выбрал эфир — зовём в эфире
             announceRadio();
             ui::drawAddRadio(phrase_, "Зову в эфире…", int(contacts::count()));
             break;
@@ -2094,7 +2110,11 @@ void loop() {
     // ставим новое объявление, пока в очереди ещё лежат неотправленные кадры: догонять
     // самих себя бессмысленно.
     static uint32_t lastHello = 0;
-    const uint32_t helloEvery = pairRoom_[0] ? 30000u : 120000u;
+
+    // Частый зов — ТОЛЬКО при знакомстве по радио. При знакомстве по сети в эфир идёт
+    // обычное редкое объявление о себе, как в любое другое время: звать по радио того,
+    // кого ищешь в интернете, бессмысленно.
+    const uint32_t helloEvery = pairViaRadio_ ? 30000u : 120000u;
     if (radioReady && millis() - lastHello > helloEvery) {
         bool queueBusy = txBusy;
         for (size_t i = 0; !queueBusy && i < kQueueSize; ++i)
