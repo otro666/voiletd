@@ -9,6 +9,8 @@
 
 #include "relays.h"
 #include "psram.h"
+#include "store_sd.h"
+#include <esp_heap_caps.h>
 
 namespace rail {
 
@@ -351,7 +353,20 @@ bool begin(const uint8_t myPeerId[20]) {
     if (g_task) return true;           // поток уже поднят
     // Ядро 0: на первом живёт основной цикл с экраном и радио, и делить его с сетью
     // незачем. Стека 8 КБ — защищённому соединению нужно заметно больше обычного.
-    xTaskCreatePinnedToCore(railTask, "vual-rail", 8192, nullptr, 1, &g_task, 0);
+    // Результат создания потока ПРОВЕРЯЕТСЯ. Стек потока живёт только во внутренней
+    // памяти (ограничение системы), и когда её в момент старта не хватает, поток молча
+    // не рождается: begin рапортует успех, на экране вечные нули, в журнале тишина —
+    // ровно та картина, которую мы наблюдали. Отказ теперь называет себя.
+    if (xTaskCreatePinnedToCore(railTask, "vual-rail", 8192, nullptr, 1,
+                                &g_task, 0) != pdPASS) {
+        g_task = nullptr;
+        char m[80];
+        snprintf(m, sizeof(m), "поток не создался (внутренней свободно %lu Б)",
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        store::log("rail", m);
+        return false;
+    }
+    store::log("rail", "рельса поднята");
     return g_task != nullptr;
 }
 

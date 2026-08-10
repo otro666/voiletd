@@ -1317,6 +1317,13 @@ void drawStatus2(const Status& st, const char* ip, bool radioOk, bool sdOk) {
     line("Сеть", ip && *ip ? ip : "не подключена", ip && *ip ? kOnline : kTextTertiary);
     line("Карта памяти", sdOk ? "есть" : "нет", sdOk ? kOnline : kWarning);
 
+    // Память — сразу после карты, а не в конце: последняя строка списка не влезала в
+    // экран, и самая полезная для разбора цифра оказывалась невидимой.
+    snprintf(buf, sizeof(buf), "внеш. %lu КБ · внутр. %lu КБ",
+             (unsigned long)(psram::freeExternal() / 1024),
+             (unsigned long)(psram::freeInternal() / 1024));
+    line("Память", buf, psram::freeInternal() < 60000 ? kWarning : kTextSecond);
+
     // Рельсы знакомства — ВСЕ ТРИ вида по отдельности: их закрывают разными способами
     // и в разных местах, и каждая может быть жива или мертва отдельно от остальных.
     {
@@ -1351,12 +1358,6 @@ void drawStatus2(const Status& st, const char* ip, bool radioOk, bool sdOk) {
     snprintf(buf, sizeof(buf), "%s %s", __DATE__, __TIME__);
     line("Сборка", buf, kTextTertiary);
 
-    // Память — рядом с рельсами не случайно: когда узлы показывают нули, первым делом
-    // смотрят сюда. Внешняя должна быть в мегабайтах, внутренняя — в сотнях килобайт.
-    snprintf(buf, sizeof(buf), "внеш. %lu КБ · внутр. %lu КБ",
-             (unsigned long)(psram::freeExternal() / 1024),
-             (unsigned long)(psram::freeInternal() / 1024));
-    line("Память", buf, psram::freeInternal() < 60000 ? kWarning : kTextSecond);
 }
 
 // ── касания ────────────────────────────────────────────────────────────────────────────

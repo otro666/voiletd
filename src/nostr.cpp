@@ -11,6 +11,7 @@
 #include "relays.h"
 #include "store_sd.h"
 #include "psram.h"
+#include <esp_heap_caps.h>
 #include "schnorr.h"
 #include "ws.h"
 
@@ -282,7 +283,20 @@ bool begin(const uint8_t myPeerId[20]) {
     }
 
     if (g_task) return true;
-    xTaskCreatePinnedToCore(nostrTask, "vual-nostr", 10240, nullptr, 1, &g_task, 0);
+    // Результат создания потока ПРОВЕРЯЕТСЯ. Стек потока живёт только во внутренней
+    // памяти (ограничение системы), и когда её в момент старта не хватает, поток молча
+    // не рождается: begin рапортует успех, на экране вечные нули, в журнале тишина —
+    // ровно та картина, которую мы наблюдали. Отказ теперь называет себя.
+    if (xTaskCreatePinnedToCore(nostrTask, "vual-nostr", 10240, nullptr, 1,
+                                &g_task, 0) != pdPASS) {
+        g_task = nullptr;
+        char m[80];
+        snprintf(m, sizeof(m), "поток не создался (внутренней свободно %lu Б)",
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        store::log("nostr", m);
+        return false;
+    }
+    store::log("nostr", "рельса поднята");
     return g_task != nullptr;
 }
 
