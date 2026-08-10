@@ -2,6 +2,23 @@
 CXX ?= g++
 FLAGS = -std=c++17 -Wall -Wextra -Iinclude
 
+# Проверка сборки прошивки БЕЗ платы и без PlatformIO.
+#
+# Настоящих библиотек платы здесь нет, но ошибки, которые я допускаю чаще всего —
+# необъявленная переменная, лишний аргумент, sizeof от указателя, — ловятся и по
+# заглушкам из test/stubs. Раньше о них сообщал лог сборки у человека через полчаса
+# после отправки; теперь они не выходят за пределы этой машины.
+check:
+	@fail=0; \
+	for f in src/*.cpp; do \
+	  out=$$($(CXX) -std=gnu++17 -fsyntax-only -Iinclude -Itest/stubs $$f 2>&1); \
+	  if [ -n "$$out" ]; then echo "=== $$f"; echo "$$out" | head -20; fail=1; fi; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "прошивка: синтаксис сошёлся ($$(ls src/*.cpp | wc -l) файлов)"; \
+	else echo "ЕСТЬ ОШИБКИ СБОРКИ"; exit 1; fi
+
+all: check test
+
 test:
 	@$(CXX) $(FLAGS) src/voile_frame.cpp src/voile_diversity.cpp test/test_core.cpp -o /tmp/vd_core
 	@/tmp/vd_core

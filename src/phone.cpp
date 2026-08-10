@@ -182,6 +182,7 @@ voile::KeyPair g_eph;                  // эфемерная пара на эт�
 uint8_t  g_nonce[16] = {};
 uint8_t  g_oid[kIdLen] = {};           // идентификатор нашего предложения
 uint8_t  g_pid[kIdLen] = {};           // наш «peer id» для рельсовых сообщений
+char     g_answeredOid[40] = {};       // на этот оффер мы уже ответили
 char     g_myCard[kMaxCard] = {};      // своя визитка, JSON
 char     g_myX[64] = {}, g_myY[64] = {};
 
