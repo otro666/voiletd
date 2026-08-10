@@ -207,8 +207,12 @@
       fetch('vual-tdeck.bin', { method: 'HEAD' }).then(function (r) {
         if (!r.ok) throw 0;
         var size = human(+(r.headers.get('content-length') || 0));
+        // Дата файла — на виду. Лежащий рядом файл подхватывается сам, и без даты
+        // легко месяц прошивать одну и ту же старую сборку, не подозревая об этом.
+        var when = r.headers.get('last-modified');
+        var stamp = when ? ' · от ' + new Date(when).toLocaleString('ru-RU') : '';
         useSource(new URL('vual-tdeck.bin', location.href).href,
-                  'vual-tdeck.bin рядом со страницей' + (size ? ' · ' + size : ''));
+                  'vual-tdeck.bin рядом со страницей' + (size ? ' · ' + size : '') + stamp);
       }).catch(function () {
         status.innerHTML = 'Рядом со страницей файла нет — выберите его вручную.';
       });
